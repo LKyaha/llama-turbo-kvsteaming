@@ -32,9 +32,27 @@ try {
         git config user.name "llama-turbo-kvsteaming CI"
         git config user.email "actions@users.noreply.github.com"
 
-        # This is deliberately an ephemeral merge. Any conflict is a hard failure:
+        # This is deliberately an ephemeral merge. Any textual conflict is a hard failure:
         # we do not publish binaries that silently drop either upstream's changes.
         git merge --no-ff --no-edit FETCH_HEAD
+
+        # Semantic merge repair:
+        # The Turbo/KV branch still references tools/parser, while current llama.cpp
+        # mainline has removed that tool. Git can merge this cleanly because the directory
+        # deletion and the CMake edit touch different paths, leaving a stale
+        # add_subdirectory(parser) that breaks every backend during CMake configure.
+        # Remove only that stale reference, and only when the directory is actually gone.
+        $toolsCmake = "tools/CMakeLists.txt"
+        if ((Test-Path $toolsCmake) -and -not (Test-Path "tools/parser")) {
+            $toolsText = Get-Content $toolsCmake -Raw
+            $repaired = $toolsText -replace '(?m)^\s*add_subdirectory\(parser\)\s*\r?\n', ''
+            if ($repaired -ne $toolsText) {
+                Set-Content -Path $toolsCmake -Value $repaired -Encoding UTF8
+                git add $toolsCmake
+                git commit -m "integration: drop stale tools/parser reference after mainline merge"
+                Write-Host "Applied semantic merge repair: removed stale tools/parser reference."
+            }
+        }
     }
 
     git submodule update --init --recursive --depth 1
