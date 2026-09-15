@@ -102,8 +102,11 @@ jobs:
             -DGGML_CUDA=ON ^
             -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
+            -DLLAMA_BUILD_COMMON=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_EXAMPLES=ON ^
+            -DLLAMA_BUILD_TESTS=OFF > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
@@ -116,8 +119,11 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S source -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
+            -DLLAMA_BUILD_COMMON=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_EXAMPLES=ON ^
+            -DLLAMA_BUILD_TESTS=OFF > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
