@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # Match the current official llama.cpp Windows Vulkan release builder.
+  # Chocolatey currently installs a newer SDK whose glslc crashes while
+  # generating moe_cache_mv variants on GitHub's Windows runner.
+  VULKAN_VERSION: '1.4.313.2'
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -62,31 +68,24 @@ jobs:
         shell: pwsh
         run: choco install ninja -y --no-progress
 
-      - name: Install Vulkan SDK
-        if: matrix.backend == 'vulkan'
-        shell: pwsh
-        run: choco install vulkan-sdk -y --no-progress
-
-      - name: Expose Vulkan SDK to CMake
+      - name: Install pinned Vulkan SDK
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          $root = 'C:\VulkanSDK'
-          if (-not (Test-Path $root)) {
-            throw "Vulkan SDK root not found at $root"
-          }
-          $sdk = Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdk) {
-            throw "No Vulkan SDK installation found under $root"
-          }
-          $bin = Join-Path $sdk.FullName 'Bin'
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          curl.exe -L --fail --retry 3 -o $installer $url
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer failed: $LASTEXITCODE" }
+
+          $sdk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          $bin = Join-Path $sdk 'Bin'
           $glslc = Join-Path $bin 'glslc.exe'
-          if (-not (Test-Path $glslc)) {
-            throw "glslc.exe not found at $glslc"
-          }
-          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Test-Path $glslc)) { throw "glslc.exe not found at $glslc" }
+
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          Write-Host "Using Vulkan SDK: $($sdk.FullName)"
+          Write-Host "Using Vulkan SDK: $sdk"
           & $glslc --version
 
       - name: Configure CUDA
@@ -102,7 +101,6 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
-          if exist build\CMakeFiles\CMakeConfigureLog.yaml type build\CMakeFiles\CMakeConfigureLog.yaml
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
           exit /b %CONFIGURE_RC%
 
@@ -117,7 +115,6 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
-          if exist build\CMakeFiles\CMakeConfigureLog.yaml type build\CMakeFiles\CMakeConfigureLog.yaml
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
           exit /b %CONFIGURE_RC%
 
@@ -137,7 +134,19 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake --build build --config Release --target llama-cli llama-server llama-bench llama-perplexity -j 2
+          cmake --build build --config Release --target llama-cli llama-server llama-bench llama-perplexity -j 2 > build-${{ matrix.name }}.log 2>&1
+          set BUILD_RC=%ERRORLEVEL%
+          type build-${{ matrix.name }}.log
+          exit /b %BUILD_RC%
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ matrix.name }}
+          path: build-${{ matrix.name }}.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Stage package
         shell: pwsh
@@ -158,13 +167,14 @@ jobs:
           backend=${{ matrix.backend }}
           cuda=${{ matrix.cuda }}
           cuda_architectures=${{ matrix.cuda_arch }}
+          vulkan_sdk=${{ matrix.backend == 'vulkan' && env.VULKAN_VERSION || '' }}
           control_repo_commit=${{ github.sha }}
-          
+
           $(Get-Content source/.integration-provenance -Raw)
           Notes:
           - Source is an ephemeral merge of PR #357 and latest ggml-org/llama.cpp master.
-          - Any merge conflict fails the build; neither side is silently dropped.
-          - Known semantic merge drift is repaired explicitly by scripts/prepare-source.ps1 and recorded as a local integration commit.
+          - Any textual merge conflict fails the build; neither side is silently dropped.
+          - Known semantic merge drift is repaired explicitly by scripts/prepare-source.ps1.
           - CUDA builds use GGML_CUDA_FA_ALL_QUANTS=ON.
           - cuda12-v100-sm70 explicitly targets SM70 and still requires real V100 validation.
           - Vulkan artifact does not claim CUDA phase-arena KV streaming support.
