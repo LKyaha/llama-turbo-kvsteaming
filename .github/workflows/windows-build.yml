@@ -1,0 +1,159 @@
+name: Windows integration builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+  schedule:
+    - cron: '23 3 * * 3'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cuda12-v100-sm70
+            backend: cuda
+            cuda: '12.4'
+            cuda_arch: '70'
+            artifact: llama-win-cuda12-v100-sm70
+          - name: cuda13.1-modern
+            backend: cuda
+            cuda: '13.1'
+            cuda_arch: '75;80;86;89;100;120'
+            artifact: llama-win-cuda13.1-modern
+          - name: cuda13.3-modern
+            backend: cuda
+            cuda: '13.3'
+            cuda_arch: '75;80;86;89;100;120'
+            artifact: llama-win-cuda13.3-modern
+          - name: vulkan-x64
+            backend: vulkan
+            cuda: ''
+            cuda_arch: ''
+            artifact: llama-win-vulkan-x64
+
+    steps:
+      - name: Checkout integration control repository
+        uses: actions/checkout@v6
+
+      - name: Materialize integrated upstream source
+        shell: pwsh
+        run: ./scripts/prepare-source.ps1
+
+      - name: Install CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: ./source/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: choco install vulkan-sdk -y --no-progress
+
+      - name: Configure CUDA
+        if: matrix.backend == 'cuda'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S source -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=ON
+
+      - name: Configure Vulkan
+        if: matrix.backend == 'vulkan'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S source -B build -G "Ninja Multi-Config" ^
+            -DGGML_VULKAN=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=ON
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake --build build --config Release --target llama-cli llama-server llama-bench llama-perplexity -j 2
+
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $PWD "package"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+
+          $bins = Get-ChildItem -Path build -Recurse -File | Where-Object {
+            $_.Name -in @('llama-cli.exe','llama-server.exe','llama-bench.exe','llama-perplexity.exe') -or
+            $_.Extension -eq '.dll'
+          }
+          foreach ($f in $bins) {
+            Copy-Item $f.FullName -Destination (Join-Path $pkg $f.Name) -Force
+          }
+
+          $sourceSha = (git -C source rev-parse HEAD).Trim()
+          $sourceCommit = (git -C source log -1 --format='%H %ci %s').Trim()
+          @"
+          artifact=${{ matrix.artifact }}
+          backend=${{ matrix.backend }}
+          cuda=${{ matrix.cuda }}
+          cuda_architectures=${{ matrix.cuda_arch }}
+          integration_source=https://github.com/TheTom/llama-cpp-turboquant
+          integration_ref=refs/pull/357/head
+          resolved_source_commit=$sourceCommit
+          control_repo_commit=${{ github.sha }}
+          
+          Notes:
+          - CUDA builds use GGML_CUDA_FA_ALL_QUANTS=ON.
+          - cuda12-v100-sm70 explicitly targets SM70 and still requires real V100 validation.
+          - Vulkan artifact does not claim CUDA phase-arena KV streaming support.
+          "@ | Set-Content -Path (Join-Path $pkg 'SOURCE-PROVENANCE.txt') -Encoding UTF8
+
+          Copy-Item source/LICENSE (Join-Path $pkg 'LICENSE-upstream') -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$pkg\*" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"
