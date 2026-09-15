@@ -13,7 +13,11 @@ if (Test-Path $Destination) {
     Remove-Item -Recurse -Force $Destination
 }
 
-git clone --filter=blob:none --no-checkout $Repository $Destination
+# Use a normal clone here instead of a promisor/partial clone. The integration
+# deliberately merges histories from two related-but-independent repositories;
+# partial-clone promisor lookups can otherwise emit scary "not our ref" errors
+# when one side references objects the other remote cannot serve.
+git clone --no-checkout $Repository $Destination
 Push-Location $Destination
 try {
     git fetch origin "+${PullRequestRef}:refs/remotes/origin/integration-kv-stream"
@@ -32,14 +36,12 @@ try {
         git config user.name "llama-turbo-kvsteaming CI"
         git config user.email "actions@users.noreply.github.com"
 
-        # This is deliberately an ephemeral merge. Any textual conflict is a hard failure:
-        # we do not publish binaries that silently drop either upstream's changes.
+        # Ephemeral merge: textual conflicts are hard failures. We never silently
+        # discard either the Turbo/KV feature branch or current llama.cpp mainline.
         git merge --no-ff --no-edit FETCH_HEAD
 
-        # Semantic merge repair #1:
-        # The Turbo/KV branch still references tools/parser, while current llama.cpp
-        # mainline has removed that tool. Git can merge this cleanly because the directory
-        # deletion and the CMake edit touch different paths, leaving a stale reference.
+        # Semantic repair #1: current mainline deleted tools/parser, while the
+        # Turbo/KV branch can leave a stale add_subdirectory(parser) behind.
         $toolsCmake = "tools/CMakeLists.txt"
         if ((Test-Path $toolsCmake) -and -not (Test-Path "tools/parser")) {
             $toolsText = Get-Content $toolsCmake -Raw
@@ -48,24 +50,23 @@ try {
                 Set-Content -Path $toolsCmake -Value $repaired -Encoding UTF8
                 git add $toolsCmake
                 git commit -m "integration: drop stale tools/parser reference after mainline merge"
-                Write-Host "Applied semantic merge repair: removed stale tools/parser reference."
+                Write-Host "Applied semantic repair: removed stale tools/parser reference."
             }
         }
 
-        # Semantic merge repair #2:
-        # Mainline replaced tools/ui/embed.cpp + llama-ui-embed with a CMake-native
-        # ui-assets.cmake generator. If the old CMake file survives while embed.cpp is
-        # deleted by mainline, generation fails. The KV/Turbo feature does not modify the
-        # UI build system, so take the current mainline UI CMake file in that exact case.
-        $uiCmake = "tools/ui/CMakeLists.txt"
-        if ((Test-Path $uiCmake) -and -not (Test-Path "tools/ui/embed.cpp")) {
-            $uiText = Get-Content $uiCmake -Raw
-            if ($uiText -match 'embed\.cpp|llama-ui-embed') {
-                git checkout $mainlineSha -- $uiCmake
-                git add $uiCmake
-                git commit -m "integration: align tools/ui CMake rules with mainline"
-                Write-Host "Applied semantic merge repair: aligned tools/ui CMake with mainline."
-            }
+        # Semantic repair #2: PR #357 does not touch the UI at all, while current
+        # mainline replaced the old llama-ui-embed host executable with a native
+        # CMake asset generator. A clean Git merge can combine old/new halves and
+        # leave missing files. Since UI is outside the feature delta, take the whole
+        # UI build chain from the exact mainline SHA, not only CMakeLists.txt.
+        $prChanges = @(
+            "tools/ui",
+            "scripts/ui-assets.cmake"
+        )
+        git checkout $mainlineSha -- $prChanges
+        if (-not (git diff --cached --quiet)) {
+            git commit -m "integration: align UI asset pipeline with mainline"
+            Write-Host "Applied semantic repair: aligned the complete UI asset pipeline with mainline."
         }
     }
 
