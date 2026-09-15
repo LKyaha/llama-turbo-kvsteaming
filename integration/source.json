@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/TheTom/llama-cpp-turboquant.git",
+  "ref": "refs/pull/357/head",
+  "upstream_project": "TheTom/llama-cpp-turboquant",
+  "upstream_pr": 357,
+  "adaptive_kv_origin": "RaymondHuang210129/llama.cpp-adaptive-kv-streaming:feature/kv-stream-phase-arena",
+  "llama_upstream": "ggml-org/llama.cpp:master"
+}
