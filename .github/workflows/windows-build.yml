@@ -30,12 +30,12 @@ jobs:
           - name: cuda13.1-modern
             backend: cuda
             cuda: '13.1'
-            cuda_arch: '75;80;86;89;100;120'
+            cuda_arch: '75;80;86;89;90;100;120'
             artifact: llama-win-cuda13.1-modern
           - name: cuda13.3-modern
             backend: cuda
             cuda: '13.3'
-            cuda_arch: '75;80;86;89;100;120'
+            cuda_arch: '75;80;86;89;90;100;120'
             artifact: llama-win-cuda13.3-modern
           - name: vulkan-x64
             backend: vulkan
@@ -47,7 +47,7 @@ jobs:
       - name: Checkout integration control repository
         uses: actions/checkout@v6
 
-      - name: Materialize integrated upstream source
+      - name: Materialize TurboQuant + KV streaming + latest llama.cpp mainline
         shell: pwsh
         run: ./scripts/prepare-source.ps1
 
@@ -109,19 +109,17 @@ jobs:
             Copy-Item $f.FullName -Destination (Join-Path $pkg $f.Name) -Force
           }
 
-          $sourceSha = (git -C source rev-parse HEAD).Trim()
-          $sourceCommit = (git -C source log -1 --format='%H %ci %s').Trim()
           @"
           artifact=${{ matrix.artifact }}
           backend=${{ matrix.backend }}
           cuda=${{ matrix.cuda }}
           cuda_architectures=${{ matrix.cuda_arch }}
-          integration_source=https://github.com/TheTom/llama-cpp-turboquant
-          integration_ref=refs/pull/357/head
-          resolved_source_commit=$sourceCommit
           control_repo_commit=${{ github.sha }}
           
+          $(Get-Content source/.integration-provenance -Raw)
           Notes:
+          - Source is an ephemeral merge of PR #357 and latest ggml-org/llama.cpp master.
+          - Any merge conflict fails the build; neither side is silently dropped.
           - CUDA builds use GGML_CUDA_FA_ALL_QUANTS=ON.
           - cuda12-v100-sm70 explicitly targets SM70 and still requires real V100 validation.
           - Vulkan artifact does not claim CUDA phase-arena KV streaming support.
