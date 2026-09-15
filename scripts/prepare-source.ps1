@@ -35,9 +35,6 @@ function Assert-CleanIntegration {
         throw "Integration still contains unmerged paths:`n$($unmerged -join "`n")"
     }
 
-    # A previous version of this script let native git failures slip through
-    # PowerShell's ErrorActionPreference, so an unresolved merge reached CMake
-    # with literal <<<<<<< markers. Never allow that again.
     $markers = @(& git grep -n -E '^(<<<<<<<|>>>>>>>)' -- . 2>$null)
     $grepExit = $LASTEXITCODE
     if ($grepExit -eq 0 -and $markers.Count -gt 0) {
@@ -54,9 +51,6 @@ function Resolve-KnownMergeConflicts {
         throw "git merge failed, but Git reports no unmerged paths"
     }
 
-    # These are deliberately narrow, reviewed resolutions for the current
-    # feature-vs-mainline history. Unknown conflicts MUST stop CI so that an
-    # upstream semantic change is never silently discarded.
     $allowed = @(
         ".github/workflows/build-wasm.yml",
         "ggml/src/ggml-metal/ggml-metal.metal"
@@ -70,16 +64,10 @@ function Resolve-KnownMergeConflicts {
     foreach ($path in $unmerged) {
         switch ($path) {
             ".github/workflows/build-wasm.yml" {
-                # Deleted by the Turbo/KV branch, modified by current mainline.
-                # This control repo does not consume upstream's WASM workflow;
-                # preserve the feature-side deletion.
                 Invoke-Git rm -f -- $path
                 Write-Host "Resolved known conflict (feature deletion): $path"
             }
             "ggml/src/ggml-metal/ggml-metal.metal" {
-                # Deleted by current mainline, modified by TurboQuant. Preserve
-                # the feature-side file so this Windows integration does not
-                # gratuitously erase TurboQuant's Metal implementation.
                 Invoke-Git add -- $path
                 Write-Host "Resolved known conflict (feature copy): $path"
             }
@@ -94,10 +82,6 @@ if (Test-Path $Destination) {
     Remove-Item -Recurse -Force $Destination
 }
 
-# Use a normal clone here instead of a promisor/partial clone. The integration
-# deliberately merges histories from two related-but-independent repositories;
-# partial-clone promisor lookups can otherwise emit scary "not our ref" errors
-# when one side references objects the other remote cannot serve.
 Invoke-Git clone --no-checkout $Repository $Destination
 Push-Location $Destination
 try {
@@ -122,10 +106,6 @@ try {
         Invoke-Git config user.name "llama-turbo-kvsteaming CI"
         Invoke-Git config user.email "actions@users.noreply.github.com"
 
-        # The TurboQuant/KV branch is hundreds of upstream commits behind current
-        # llama.cpp. Merge current mainline while resolving conflicting *content
-        # hunks* in favor of the feature branch. This is deliberately `-X ours`,
-        # NOT `-s ours`: all non-conflicting mainline changes are incorporated.
         & git merge --no-ff --no-edit -X ours FETCH_HEAD
         $mergeExit = $LASTEXITCODE
         if ($mergeExit -ne 0) {
@@ -133,8 +113,6 @@ try {
         }
         Assert-CleanIntegration
 
-        # Semantic repair #1: current mainline deleted tools/parser, while the
-        # Turbo/KV branch can leave a stale add_subdirectory(parser) behind.
         $toolsCmake = "tools/CMakeLists.txt"
         if ((Test-Path $toolsCmake) -and -not (Test-Path "tools/parser")) {
             $toolsText = Get-Content $toolsCmake -Raw
@@ -147,15 +125,13 @@ try {
             }
         }
 
-        # Semantic repair #2: PR #357 does not touch the UI at all, while current
-        # mainline replaced the old llama-ui-embed host executable with a native
-        # CMake asset generator. Since UI is outside the feature delta, take the
-        # complete UI build chain from the exact mainline SHA.
         $mainlineUiPaths = @(
             "tools/ui",
             "scripts/ui-assets.cmake"
         )
-        Invoke-Git checkout $mainlineSha -- $mainlineUiPaths
+        foreach ($uiPath in $mainlineUiPaths) {
+            Invoke-Git checkout $mainlineSha -- $uiPath
+        }
         & git diff --cached --quiet
         $cachedDiffExit = $LASTEXITCODE
         if ($cachedDiffExit -eq 1) {
