@@ -58,11 +58,16 @@ jobs:
         run: ./scripts/prepare-source.ps1
 
       - name: Install CUDA toolkit
-        if: matrix.backend == 'cuda'
+        if: matrix.backend == 'cuda' && matrix.cuda != '13.3'
         uses: ./source/.github/actions/windows-setup-cuda
         with:
           cuda_version: ${{ matrix.cuda }}
           cuda_arch: x64
+
+      - name: Install CUDA 13.3.1 toolkit
+        if: matrix.backend == 'cuda' && matrix.cuda == '13.3'
+        shell: pwsh
+        run: ./scripts/setup-cuda-13.3.ps1
 
       - name: Install Ninja
         shell: pwsh
@@ -98,7 +103,7 @@ jobs:
             -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=OFF > configure-${{ matrix.name }}.log 2>&1
+            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
@@ -112,7 +117,7 @@ jobs:
           cmake -S source -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=OFF > configure-${{ matrix.name }}.log 2>&1
+            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
           set CONFIGURE_RC=%ERRORLEVEL%
           type configure-${{ matrix.name }}.log
           if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
