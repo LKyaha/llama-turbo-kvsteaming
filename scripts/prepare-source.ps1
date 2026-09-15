@@ -78,6 +78,27 @@ function Resolve-KnownMergeConflicts {
     Invoke-Git commit --no-edit
 }
 
+function Repair-UnorderedMapInclude {
+    $backendCpp = "ggml/src/ggml-backend.cpp"
+    if (-not (Test-Path $backendCpp)) {
+        return
+    }
+
+    $backendText = Get-Content $backendCpp -Raw
+    if (($backendText -match 'std::unordered_map') -and ($backendText -notmatch '#include\s*<unordered_map>')) {
+        $needle = "#include <mutex>"
+        if (-not $backendText.Contains($needle)) {
+            throw "ggml-backend.cpp uses std::unordered_map but no stable include insertion point was found"
+        }
+
+        $backendText = $backendText.Replace($needle, "$needle`r`n#include <unordered_map>")
+        Set-Content -Path $backendCpp -Value $backendText -Encoding UTF8
+        Invoke-Git add $backendCpp
+        Invoke-Git commit -m "integration: restore unordered_map include after merge"
+        Write-Host "Applied semantic repair: restored <unordered_map> include required by merged ggml-backend.cpp."
+    }
+}
+
 if (Test-Path $Destination) {
     Remove-Item -Recurse -Force $Destination
 }
@@ -142,6 +163,7 @@ try {
             throw "git diff --cached --quiet failed with exit code $cachedDiffExit"
         }
 
+        Repair-UnorderedMapInclude
         Assert-CleanIntegration
     }
 
