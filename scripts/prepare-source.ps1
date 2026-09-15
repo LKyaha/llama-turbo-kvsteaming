@@ -1,7 +1,10 @@
 param(
     [string]$Destination = "source",
     [string]$Repository = "https://github.com/TheTom/llama-cpp-turboquant.git",
-    [string]$PullRequestRef = "refs/pull/357/head"
+    [string]$PullRequestRef = "refs/pull/357/head",
+    [string]$MainlineRepository = "https://github.com/ggml-org/llama.cpp.git",
+    [string]$MainlineRef = "master",
+    [switch]$SkipMainlineMerge
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,17 +16,52 @@ if (Test-Path $Destination) {
 git clone --filter=blob:none --no-checkout $Repository $Destination
 Push-Location $Destination
 try {
-    git fetch --depth 1 origin "+${PullRequestRef}:refs/remotes/origin/integration-kv-stream"
+    git fetch origin "+${PullRequestRef}:refs/remotes/origin/integration-kv-stream"
     git checkout --detach refs/remotes/origin/integration-kv-stream
+
+    $featureSha = (git rev-parse HEAD).Trim()
+    $mainlineSha = "not-merged"
+
+    if (-not $SkipMainlineMerge) {
+        if (-not (git remote | Select-String -SimpleMatch "mainline")) {
+            git remote add mainline $MainlineRepository
+        }
+        git fetch mainline $MainlineRef
+        $mainlineSha = (git rev-parse FETCH_HEAD).Trim()
+
+        git config user.name "llama-turbo-kvsteaming CI"
+        git config user.email "actions@users.noreply.github.com"
+
+        # This is deliberately an ephemeral merge. Any conflict is a hard failure:
+        # we do not publish binaries that silently drop either upstream's changes.
+        git merge --no-ff --no-edit FETCH_HEAD
+    }
+
     git submodule update --init --recursive --depth 1
 
-    $sha = (git rev-parse HEAD).Trim()
-    $describe = (git log -1 --format="%H%n%ci%n%s") -join "`n"
+    $resolvedSha = (git rev-parse HEAD).Trim()
+    $resolvedCommit = (git log -1 --format="%H %ci %s").Trim()
 
-    Write-Host "Resolved integration source: $sha"
-    Write-Host $describe
+    @"
+feature_source=$Repository
+feature_ref=$PullRequestRef
+feature_sha=$featureSha
+mainline_source=$MainlineRepository
+mainline_ref=$MainlineRef
+mainline_sha=$mainlineSha
+resolved_sha=$resolvedSha
+resolved_commit=$resolvedCommit
+"@ | Set-Content -Path ".integration-provenance" -Encoding UTF8
 
-    "SOURCE_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 -ErrorAction SilentlyContinue
+    Write-Host "Feature source SHA: $featureSha"
+    Write-Host "Mainline SHA: $mainlineSha"
+    Write-Host "Resolved integration SHA: $resolvedSha"
+
+    if ($env:GITHUB_ENV) {
+        "FEATURE_SHA=$featureSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "MAINLINE_SHA=$mainlineSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SOURCE_SHA=$resolvedSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
 }
 finally {
     Pop-Location
