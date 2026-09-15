@@ -2,12 +2,12 @@
 
 A reproducible integration/build repository for a Windows-focused llama.cpp stack combining:
 
-- llama.cpp lineage via `TheTom/llama-cpp-turboquant`
+- latest `ggml-org/llama.cpp` mainline
 - TurboQuant / Turbo2 / Turbo3 / Turbo4 KV-cache support
 - Raymond Huang's adaptive KV streaming phase-arena design, as integrated and generalized by the TurboQuant KV-streaming work
 - reproducible Windows CUDA and Vulkan binary builds
 
-This repository is intentionally an **integration control plane**, not a manually copied snapshot of hundreds of thousands of upstream source lines. CI materializes the exact upstream source ref described in `UPSTREAMS.md`, builds it, packages the binaries, and records source provenance in every artifact.
+This repository is intentionally an **integration control plane**, not a manually copied snapshot of hundreds of thousands of upstream source lines. CI materializes the TurboQuant + KV-streaming feature head, temporarily merges the latest llama.cpp `master`, builds the result, packages the binaries, and records all resolved source SHAs in every artifact. A merge conflict is a hard failure rather than silently dropping either side.
 
 ## Windows build targets
 
@@ -20,11 +20,13 @@ This repository is intentionally an **integration control plane**, not a manuall
 
 CUDA builds explicitly enable `GGML_CUDA_FA_ALL_QUANTS=ON`, because streamed Turbo KV attention otherwise may fall back to the much slower F16 dequantization path.
 
-## Source baseline
+## Source composition
 
-The current integration source is the head of `TheTom/llama-cpp-turboquant` PR #357, fetched through GitHub's pull-request ref. That PR ports/generalizes Raymond Huang's `feature/kv-stream-phase-arena` work and wires Turbo2/3/4 into the streaming attention path.
+The feature side is `TheTom/llama-cpp-turboquant` PR #357, fetched through GitHub's pull-request ref. That PR ports/generalizes Raymond Huang's `feature/kv-stream-phase-arena` work and wires Turbo2/3/4 into the streaming attention path.
 
-See [`UPSTREAMS.md`](UPSTREAMS.md) for source-of-truth refs and maintenance policy.
+The materializer then fetches the latest `ggml-org/llama.cpp` `master` and creates an **ephemeral merge**. This means CI answers the question we actually care about: does *current mainline + TurboQuant/Turbo4 + adaptive KV streaming* still merge and compile today?
+
+See [`UPSTREAMS.md`](UPSTREAMS.md) for source-of-truth refs and maintenance policy, and [`VALIDATION.md`](VALIDATION.md) for hardware gates.
 
 ## Build locally
 
@@ -34,21 +36,28 @@ PowerShell:
 ./scripts/prepare-source.ps1
 ```
 
-This creates `source/` at the integration ref. Build it with ordinary llama.cpp CMake options; the GitHub Actions workflow is the canonical reference for the exact Windows configurations.
+This creates `source/` containing the same three-way integration tree used by CI. Build it with ordinary llama.cpp CMake options; the GitHub Actions workflow is the canonical reference for the exact Windows configurations.
+
+To inspect only the feature branch without merging latest mainline:
+
+```powershell
+./scripts/prepare-source.ps1 -SkipMainlineMerge
+```
 
 ## Releases
 
 - Pushes / pull requests: build artifacts are uploaded to the workflow run.
+- A weekly scheduled build rechecks the moving upstreams.
 - Manual `workflow_dispatch`: builds the full matrix.
 - Tags matching `v*`: the same artifacts are attached to a GitHub Release.
 
-Every package contains `SOURCE-PROVENANCE.txt` with the actual resolved commit SHA.
+Every package contains `SOURCE-PROVENANCE.txt` with the Turbo/KV-stream feature SHA, llama.cpp mainline SHA, final integration SHA, backend, toolkit, and architecture list.
 
 ## Maintenance rules
 
-1. Do not blindly merge upstream changes directly into a release branch.
-2. First update/test the integration source ref.
-3. Require all Windows build legs to compile before tagging a release.
+1. Do not blindly merge upstream changes into a permanent release branch.
+2. Let the ephemeral merge expose conflicts first.
+3. Require all intended Windows build legs to compile before tagging a release.
 4. Treat V100 support as provisional until exercised on real SM70 hardware.
 5. Do not claim Vulkan KV phase-arena streaming until the Vulkan backend actually implements and validates it.
 
