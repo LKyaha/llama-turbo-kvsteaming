@@ -77,7 +77,12 @@ jobs:
             -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_arch }}" ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=ON
+            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
+          set CONFIGURE_RC=%ERRORLEVEL%
+          type configure-${{ matrix.name }}.log
+          if exist build\CMakeFiles\CMakeConfigureLog.yaml type build\CMakeFiles\CMakeConfigureLog.yaml
+          if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
+          exit /b %CONFIGURE_RC%
 
       - name: Configure Vulkan
         if: matrix.backend == 'vulkan'
@@ -87,7 +92,24 @@ jobs:
           cmake -S source -B build -G "Ninja Multi-Config" ^
             -DGGML_VULKAN=ON ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=ON
+            -DLLAMA_BUILD_EXAMPLES=ON > configure-${{ matrix.name }}.log 2>&1
+          set CONFIGURE_RC=%ERRORLEVEL%
+          type configure-${{ matrix.name }}.log
+          if exist build\CMakeFiles\CMakeConfigureLog.yaml type build\CMakeFiles\CMakeConfigureLog.yaml
+          if exist build\CMakeFiles\CMakeError.log type build\CMakeFiles\CMakeError.log
+          exit /b %CONFIGURE_RC%
+
+      - name: Upload configure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: configure-diagnostics-${{ matrix.name }}
+          path: |
+            configure-${{ matrix.name }}.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build
         shell: cmd
