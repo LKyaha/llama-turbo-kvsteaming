@@ -36,12 +36,10 @@ try {
         # we do not publish binaries that silently drop either upstream's changes.
         git merge --no-ff --no-edit FETCH_HEAD
 
-        # Semantic merge repair:
+        # Semantic merge repair #1:
         # The Turbo/KV branch still references tools/parser, while current llama.cpp
         # mainline has removed that tool. Git can merge this cleanly because the directory
-        # deletion and the CMake edit touch different paths, leaving a stale
-        # add_subdirectory(parser) that breaks every backend during CMake configure.
-        # Remove only that stale reference, and only when the directory is actually gone.
+        # deletion and the CMake edit touch different paths, leaving a stale reference.
         $toolsCmake = "tools/CMakeLists.txt"
         if ((Test-Path $toolsCmake) -and -not (Test-Path "tools/parser")) {
             $toolsText = Get-Content $toolsCmake -Raw
@@ -51,6 +49,22 @@ try {
                 git add $toolsCmake
                 git commit -m "integration: drop stale tools/parser reference after mainline merge"
                 Write-Host "Applied semantic merge repair: removed stale tools/parser reference."
+            }
+        }
+
+        # Semantic merge repair #2:
+        # Mainline replaced tools/ui/embed.cpp + llama-ui-embed with a CMake-native
+        # ui-assets.cmake generator. If the old CMake file survives while embed.cpp is
+        # deleted by mainline, generation fails. The KV/Turbo feature does not modify the
+        # UI build system, so take the current mainline UI CMake file in that exact case.
+        $uiCmake = "tools/ui/CMakeLists.txt"
+        if ((Test-Path $uiCmake) -and -not (Test-Path "tools/ui/embed.cpp")) {
+            $uiText = Get-Content $uiCmake -Raw
+            if ($uiText -match 'embed\.cpp|llama-ui-embed') {
+                git checkout $mainlineSha -- $uiCmake
+                git add $uiCmake
+                git commit -m "integration: align tools/ui CMake rules with mainline"
+                Write-Host "Applied semantic merge repair: aligned tools/ui CMake with mainline."
             }
         }
     }
