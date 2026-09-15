@@ -21,11 +21,16 @@ function Invoke-Git {
     }
 }
 
-function Assert-CleanIntegration {
-    $unmerged = @(& git diff --name-only --diff-filter=U)
+function Get-UnmergedPaths {
+    $paths = @(& git diff --name-only --diff-filter=U)
     if ($LASTEXITCODE -ne 0) {
         throw "git diff --diff-filter=U failed with exit code $LASTEXITCODE"
     }
+    return $paths
+}
+
+function Assert-CleanIntegration {
+    $unmerged = @(Get-UnmergedPaths)
     if ($unmerged.Count -gt 0) {
         throw "Integration still contains unmerged paths:`n$($unmerged -join "`n")"
     }
@@ -41,6 +46,48 @@ function Assert-CleanIntegration {
     if ($grepExit -ne 0 -and $grepExit -ne 1) {
         throw "git grep conflict-marker scan failed with exit code $grepExit"
     }
+}
+
+function Resolve-KnownMergeConflicts {
+    $unmerged = @(Get-UnmergedPaths)
+    if ($unmerged.Count -eq 0) {
+        throw "git merge failed, but Git reports no unmerged paths"
+    }
+
+    # These are deliberately narrow, reviewed resolutions for the current
+    # feature-vs-mainline history. Unknown conflicts MUST stop CI so that an
+    # upstream semantic change is never silently discarded.
+    $allowed = @(
+        ".github/workflows/build-wasm.yml",
+        "ggml/src/ggml-metal/ggml-metal.metal"
+    )
+
+    $unknown = @($unmerged | Where-Object { $_ -notin $allowed })
+    if ($unknown.Count -gt 0) {
+        throw "Unknown upstream merge conflicts require review:`n$($unknown -join "`n")"
+    }
+
+    foreach ($path in $unmerged) {
+        switch ($path) {
+            ".github/workflows/build-wasm.yml" {
+                # Deleted by the Turbo/KV branch, modified by current mainline.
+                # This control repo does not consume upstream's WASM workflow;
+                # preserve the feature-side deletion.
+                Invoke-Git rm -f -- $path
+                Write-Host "Resolved known conflict (feature deletion): $path"
+            }
+            "ggml/src/ggml-metal/ggml-metal.metal" {
+                # Deleted by current mainline, modified by TurboQuant. Preserve
+                # the feature-side file so this Windows integration does not
+                # gratuitously erase TurboQuant's Metal implementation.
+                Invoke-Git add -- $path
+                Write-Host "Resolved known conflict (feature copy): $path"
+            }
+        }
+    }
+
+    Assert-CleanIntegration
+    Invoke-Git commit --no-edit
 }
 
 if (Test-Path $Destination) {
@@ -76,16 +123,14 @@ try {
         Invoke-Git config user.email "actions@users.noreply.github.com"
 
         # The TurboQuant/KV branch is hundreds of upstream commits behind current
-        # llama.cpp. A plain merge can therefore hit overlapping edits in hot files.
-        # Merge current mainline while resolving conflicting *hunks* in favor of the
-        # feature branch. This is deliberately `-X ours`, NOT `-s ours`: all
-        # non-conflicting mainline changes are still incorporated.
-        #
-        # Why feature-first for conflicts? Turbo quant types, direct attention and
-        # the phase-arena streaming hooks are exactly the delta this integration is
-        # meant to preserve. CI compilation then tells us where newer upstream APIs
-        # require explicit semantic repair.
-        Invoke-Git merge --no-ff --no-edit -X ours FETCH_HEAD
+        # llama.cpp. Merge current mainline while resolving conflicting *content
+        # hunks* in favor of the feature branch. This is deliberately `-X ours`,
+        # NOT `-s ours`: all non-conflicting mainline changes are incorporated.
+        & git merge --no-ff --no-edit -X ours FETCH_HEAD
+        $mergeExit = $LASTEXITCODE
+        if ($mergeExit -ne 0) {
+            Resolve-KnownMergeConflicts
+        }
         Assert-CleanIntegration
 
         # Semantic repair #1: current mainline deleted tools/parser, while the
@@ -104,9 +149,8 @@ try {
 
         # Semantic repair #2: PR #357 does not touch the UI at all, while current
         # mainline replaced the old llama-ui-embed host executable with a native
-        # CMake asset generator. A merge can combine old/new halves and leave
-        # missing files. Since UI is outside the feature delta, take the whole UI
-        # build chain from the exact mainline SHA.
+        # CMake asset generator. Since UI is outside the feature delta, take the
+        # complete UI build chain from the exact mainline SHA.
         $mainlineUiPaths = @(
             "tools/ui",
             "scripts/ui-assets.cmake"
@@ -139,7 +183,7 @@ feature_sha=$featureSha
 mainline_source=$MainlineRepository
 mainline_ref=$MainlineRef
 mainline_sha=$mainlineSha
-merge_strategy=recursive_feature_first_conflicts
+merge_strategy=recursive_feature_first_conflicts_with_reviewed_modify_delete_resolutions
 resolved_sha=$resolvedSha
 resolved_commit=$resolvedCommit
 "@ | Set-Content -Path ".integration-provenance" -Encoding UTF8
