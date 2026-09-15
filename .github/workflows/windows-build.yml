@@ -67,6 +67,28 @@ jobs:
         shell: pwsh
         run: choco install vulkan-sdk -y --no-progress
 
+      - name: Expose Vulkan SDK to CMake
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $root = 'C:\VulkanSDK'
+          if (-not (Test-Path $root)) {
+            throw "Vulkan SDK root not found at $root"
+          }
+          $sdk = Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) {
+            throw "No Vulkan SDK installation found under $root"
+          }
+          $bin = Join-Path $sdk.FullName 'Bin'
+          $glslc = Join-Path $bin 'glslc.exe'
+          if (-not (Test-Path $glslc)) {
+            throw "glslc.exe not found at $glslc"
+          }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "Using Vulkan SDK: $($sdk.FullName)"
+          & $glslc --version
+
       - name: Configure CUDA
         if: matrix.backend == 'cuda'
         shell: cmd
@@ -142,6 +164,7 @@ jobs:
           Notes:
           - Source is an ephemeral merge of PR #357 and latest ggml-org/llama.cpp master.
           - Any merge conflict fails the build; neither side is silently dropped.
+          - Known semantic merge drift is repaired explicitly by scripts/prepare-source.ps1 and recorded as a local integration commit.
           - CUDA builds use GGML_CUDA_FA_ALL_QUANTS=ON.
           - cuda12-v100-sm70 explicitly targets SM70 and still requires real V100 validation.
           - Vulkan artifact does not claim CUDA phase-arena KV streaming support.
