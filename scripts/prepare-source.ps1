@@ -99,6 +99,39 @@ function Repair-UnorderedMapInclude {
     }
 }
 
+
+function Repair-FattnMergeDrift {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FeatureSha
+    )
+
+    $fattnCu = "ggml/src/ggml-cuda/fattn.cu"
+    if (-not (Test-Path $fattnCu)) {
+        return
+    }
+
+    $fattnText = Get-Content $fattnCu -Raw
+    $sentinelPattern = 'static\s+__global__\s+void\s+flash_attn_mask_to_sparse_indices\s*\('
+    $sentinelCount = [regex]::Matches($fattnText, $sentinelPattern).Count
+    if ($sentinelCount -le 1) {
+        return
+    }
+
+    Write-Host "Detected semantic merge drift in fattn.cu ($sentinelCount copies of flash_attn_mask_to_sparse_indices); restoring the feature-owned translation unit."
+    Invoke-Git checkout $FeatureSha -- $fattnCu
+
+    $repairedText = Get-Content $fattnCu -Raw
+    $repairedCount = [regex]::Matches($repairedText, $sentinelPattern).Count
+    if ($repairedCount -ne 1) {
+        throw "Feature fattn.cu invariant failed after restore: expected exactly one flash_attn_mask_to_sparse_indices definition, found $repairedCount"
+    }
+
+    Invoke-Git add $fattnCu
+    Invoke-Git commit -m "integration: keep feature fattn translation unit coherent"
+    Write-Host "Applied semantic repair: kept the KV-stream/TurboQuant fattn.cu as one coherent feature-owned translation unit."
+}
+
 if (Test-Path $Destination) {
     Remove-Item -Recurse -Force $Destination
 }
@@ -163,6 +196,7 @@ try {
             throw "git diff --cached --quiet failed with exit code $cachedDiffExit"
         }
 
+        Repair-FattnMergeDrift -FeatureSha $featureSha
         Repair-UnorderedMapInclude
         Assert-CleanIntegration
     }
