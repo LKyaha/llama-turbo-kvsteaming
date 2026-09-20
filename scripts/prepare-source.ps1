@@ -164,6 +164,41 @@ function Repair-ModelHeaderMergeDrift {
         '^\s*\{\s*LLM_KV_DFLASH_SELECTOR_TOP_K\s*,.*\},\s*$'
     )) { $changed += $archCpp }
 
+    # Current mainline's HY-V4 loader consumes the hyper-connection magnitude
+    # GGUF key.  The feature-first merge retained the older key registry and
+    # hparams structure, leaving that otherwise complete model source unable to
+    # compile.  Backport the complete enum/registry/storage trio together.
+    $hyV4 = "src/models/hy-v4.cpp"
+    $needsHcMagnitude = (Test-Path $hyV4) -and ((Get-Content $hyV4 -Raw) -match '\bLLM_KV_HYPER_CONNECTION_MAGNITUDE\b')
+    if ($needsHcMagnitude) {
+        $archText = Get-Content $archH -Raw
+        if ($archText -notmatch '\bLLM_KV_HYPER_CONNECTION_MAGNITUDE\b') {
+            $old = 'LLM_KV_HYPER_CONNECTION_EPSILON,'
+            if (-not $archText.Contains($old)) { throw 'Cannot restore HY-V4 magnitude key: enum anchor is missing' }
+            Set-Content -Path $archH -Value $archText.Replace($old, "$old`r`n    LLM_KV_HYPER_CONNECTION_MAGNITUDE,") -Encoding UTF8
+            $changed += $archH
+        }
+
+        $hparamsText = Get-Content $hparamsH -Raw
+        if ($hparamsText -notmatch '\bhc_magnitude\b') {
+            $old = 'uint32_t hc_low_rank = 0;'
+            if (-not $hparamsText.Contains($old)) { throw 'Cannot restore HY-V4 magnitude hparam: storage anchor is missing' }
+            $new = "$old`r`n`r`n    // scale of the hyper-connection post gate (DeepSeek-V4 hardcodes 2.0)`r`n    float    hc_magnitude = 0.0f;"
+            Set-Content -Path $hparamsH -Value $hparamsText.Replace($old, $new) -Encoding UTF8
+            $changed += $hparamsH
+        }
+
+        $archCppText = Get-Content $archCpp -Raw
+        if ($archCppText -notmatch '\bLLM_KV_HYPER_CONNECTION_MAGNITUDE\b') {
+            $old = '{ LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },'
+            if (-not $archCppText.Contains($old)) { throw 'Cannot restore HY-V4 magnitude key: registry anchor is missing' }
+            $new = "$old`r`n    { LLM_KV_HYPER_CONNECTION_MAGNITUDE,             `"%s.hyper_connection.magnitude`"             },"
+            Set-Content -Path $archCpp -Value $archCppText.Replace($old, $new) -Encoding UTF8
+            $changed += $archCpp
+        }
+        Write-Host 'Restored the HY-V4 hyper-connection magnitude key, registry entry, and hparam storage.'
+    }
+
     $modelsH = "src/models/models.h"
     if (Test-Path $modelsH) {
         $modelsText = Get-Content $modelsH -Raw
