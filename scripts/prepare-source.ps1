@@ -310,6 +310,109 @@ function Repair-FattnMergeDrift {
     Write-Host "Applied semantic repair: kept the KV-stream/TurboQuant fattn.cu as one coherent feature-owned translation unit."
 }
 
+function Repair-ModelApiMergeDrift {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MainlineSha
+    )
+
+    $changed = @()
+
+    # Mainline moved this shared GDN normalization helper into models.h.  The
+    # feature-first merge can keep the old header while accepting the new Qwen
+    # model sources that call it; add the complete inline implementation so the
+    # callers and semantics stay identical to the mainline implementation.
+    $modelsH = "src/models/models.h"
+    if (Test-Path $modelsH) {
+        $modelsText = Get-Content $modelsH -Raw
+        $qwenCalls = [regex]::Matches($modelsText, 'build_gdn_l2_norm').Count
+        if ($qwenCalls -eq 0) {
+            $qwenCalls = @(& git grep -n 'build_gdn_l2_norm' -- 'src/models/qwen35*.cpp' 'src/models/qwen3next.cpp' 2>$null).Count
+        }
+        if (($qwenCalls -gt 0) -and ($modelsText -notmatch 'static\s+inline\s+ggml_tensor\s*\*\s*build_gdn_l2_norm\s*\(')) {
+            $anchor = 'class llama_memory_hybrid_idx_context;'
+            if (-not $modelsText.Contains($anchor)) {
+                throw "Cannot restore build_gdn_l2_norm: models.h anchor is missing"
+            }
+            $helper = @"
+
+// ref: https://github.com/ggml-org/llama.cpp/pull/28068
+static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+    const float n = x->ne[0];
+
+    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+}
+"@
+            Set-Content -Path $modelsH -Value $modelsText.Replace($anchor, $anchor + $helper) -Encoding UTF8
+            $changed += $modelsH
+            Write-Host 'Restored the mainline GDN L2-normalization helper required by merged Qwen sources.'
+        }
+    }
+
+    # qwen4exp switched from a scalar expert width to a per-layer array in
+    # mainline.  Restore the complete mainline translation unit only when the
+    # header has the new array API and the stale source still reads n_ff_exp.
+    $qwen4exp = "src/models/qwen4exp.cpp"
+    $hparamsH = "src/llama-hparams.h"
+    if ((Test-Path $qwen4exp) -and (Test-Path $hparamsH)) {
+        $qwenText = Get-Content $qwen4exp -Raw
+        $hparamsText = Get-Content $hparamsH -Raw
+        if (($hparamsText -match '\bn_ff_exp_arr\b') -and
+            ($qwenText -match 'hparams\.n_ff_exp\b') -and
+            ($qwenText -notmatch 'hparams\.n_ff_exp_arr\b')) {
+            Invoke-Git checkout $MainlineSha -- $qwen4exp
+            $repairedText = Get-Content $qwen4exp -Raw
+            if (($repairedText -notmatch 'hparams\.n_ff_exp_arr\b') -or ($repairedText -match 'hparams\.n_ff_exp\s*(?:,|\?)')) {
+                throw "qwen4exp mainline API repair invariant failed"
+            }
+            $changed += $qwen4exp
+            Write-Host 'Restored the mainline qwen4exp implementation matching the per-layer expert-width API.'
+        }
+    }
+
+    $changed = @($changed | Select-Object -Unique)
+    if ($changed.Count -gt 0) {
+        foreach ($path in $changed) { Invoke-Git add -- $path }
+        Invoke-Git commit -m "integration: reconcile Qwen model API drift"
+    }
+}
+
+function Repair-CudaFattnSharedMemory {
+    $fattnVec = "ggml/src/ggml-cuda/fattn-vec.cuh"
+    if (-not (Test-Path $fattnVec)) { return }
+
+    $text = Get-Content $fattnVec -Raw
+    $old = 'V_is_turbo ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8) : 128 / cpy_nb'
+    if (-not $text.Contains($old)) { return }
+
+    # At D=512 the /8 Turbo-V setting makes ne_combine exceed CUDA's 48 KiB
+    # static shared-memory limit.  /4 halves V columns per iteration, preserving
+    # the existing indexing/reduction scheme while keeping this instantiation in
+    # bounds; retain /8 for the smaller head dimensions it was tuned for.
+    $new = 'V_is_turbo ? (D >= 512 ? (nthreads_V_q / 4 < 1 ? 1 : nthreads_V_q / 4) : (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8)) : 128 / cpy_nb'
+    Set-Content -Path $fattnVec -Value $text.Replace($old, $new) -Encoding UTF8
+    Invoke-Git add -- $fattnVec
+    Invoke-Git commit -m "integration: bound Turbo-V flash attention shared memory"
+    Write-Host 'Adjusted D=512 Turbo-V flash-attention thread grouping to fit CUDA static shared memory.'
+}
+
+function Repair-VulkanFlashAttentionTypeConstants {
+    $shader = "ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp"
+    if (-not (Test-Path $shader)) { return }
+
+    $text = Get-Content $shader -Raw
+    $legacyCount = [regex]::Matches($text, '\bGGML_TYPE_F16\b').Count
+    if ($legacyCount -eq 0) { return }
+    if ($legacyCount -gt 5) {
+        throw "Unexpected GGML_TYPE_F16 usage count in flash_attn_cm1.comp: $legacyCount"
+    }
+
+    Set-Content -Path $shader -Value $text.Replace('GGML_TYPE_F16', 'FA_TYPE_F16') -Encoding UTF8
+    Invoke-Git add -- $shader
+    Invoke-Git commit -m "integration: use Vulkan flash-attention type constants"
+    Write-Host 'Replaced stale host enum references with shader-local FA_TYPE_F16 constants.'
+}
+
 if (Test-Path $Destination) {
     Remove-Item -Recurse -Force $Destination
 }
@@ -376,8 +479,11 @@ try {
 
         Repair-FattnMergeDrift -FeatureSha $featureSha
         Repair-ModelHeaderMergeDrift
+        Repair-ModelApiMergeDrift -MainlineSha $mainlineSha
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
+        Repair-CudaFattnSharedMemory
+        Repair-VulkanFlashAttentionTypeConstants
         Repair-UnorderedMapInclude
         Assert-CleanIntegration
     }
