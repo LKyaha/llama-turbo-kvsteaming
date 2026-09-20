@@ -313,7 +313,9 @@ function Repair-FattnMergeDrift {
 function Repair-ModelApiMergeDrift {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$MainlineSha
+        [string]$MainlineSha,
+        [Parameter(Mandatory = $true)]
+        [string]$FeatureSha
     )
 
     $changed = @()
@@ -350,23 +352,35 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     }
 
     # qwen4exp switched from a scalar expert width to a per-layer array in
-    # mainline.  Restore the complete mainline translation unit only when the
-    # header has the new array API and the stale source still reads n_ff_exp.
+    # mainline.  Keep the feature translation unit (its graph uses feature-owned
+    # HC/QSA APIs), then make only the two hparams API changes it needs.
     $qwen4exp = "src/models/qwen4exp.cpp"
     $hparamsH = "src/llama-hparams.h"
     if ((Test-Path $qwen4exp) -and (Test-Path $hparamsH)) {
         $qwenText = Get-Content $qwen4exp -Raw
         $hparamsText = Get-Content $hparamsH -Raw
-        if (($hparamsText -match '\bn_ff_exp_arr\b') -and
-            ($qwenText -match 'hparams\.n_ff_exp\b') -and
-            ($qwenText -notmatch 'hparams\.n_ff_exp_arr\b')) {
-            Invoke-Git checkout $MainlineSha -- $qwen4exp
+        $usesOldExpertWidth = ($qwenText -match 'hparams\.n_ff_exp\b') -and
+                              ($qwenText -notmatch 'hparams\.n_ff_exp_arr\b')
+        $usesIncompatibleMainlineGraph = ($qwenText -match '\bggml_dsv4_hc_pre_gated\b') -or
+                                        ($qwenText -match 'is_ple_impl\.reset\s*\(') -or
+                                        ($qwenText -match '\bllm_graph_input_qsa\b')
+        if (($hparamsText -match '\bn_ff_exp_arr\b') -and ($usesOldExpertWidth -or $usesIncompatibleMainlineGraph)) {
+            Invoke-Git checkout $FeatureSha -- $qwen4exp
             $repairedText = Get-Content $qwen4exp -Raw
-            if (($repairedText -notmatch 'hparams\.n_ff_exp_arr\b') -or ($repairedText -match 'hparams\.n_ff_exp\s*(?:,|\?)')) {
-                throw "qwen4exp mainline API repair invariant failed"
+            $oldLoad = 'ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);'
+            $newLoad = 'ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);'
+            $oldWidth = 'hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used'
+            $newWidth = 'hparams.n_ff_exp(il) ? hparams.n_ff_exp(il) : n_ff / n_expert_used'
+            if ((-not $repairedText.Contains($oldLoad)) -or (-not $repairedText.Contains($oldWidth))) {
+                throw "Feature qwen4exp API repair anchor is missing"
             }
+            $repairedText = $repairedText.Replace($oldLoad, $newLoad).Replace($oldWidth, $newWidth)
+            if (($repairedText -notmatch 'hparams\.n_ff_exp_arr\b') -or ($repairedText -match 'hparams\.n_ff_exp\s*(?:,|\?)')) {
+                throw "qwen4exp feature API repair invariant failed"
+            }
+            Set-Content -Path $qwen4exp -Value $repairedText -Encoding UTF8
             $changed += $qwen4exp
-            Write-Host 'Restored the mainline qwen4exp implementation matching the per-layer expert-width API.'
+            Write-Host 'Adapted the feature qwen4exp implementation to the mainline per-layer expert-width API.'
         }
     }
 
@@ -397,20 +411,37 @@ function Repair-CudaFattnSharedMemory {
 }
 
 function Repair-VulkanFlashAttentionTypeConstants {
-    $shader = "ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp"
-    if (-not (Test-Path $shader)) { return }
-
-    $text = Get-Content $shader -Raw
-    $legacyCount = [regex]::Matches($text, '\bGGML_TYPE_F16\b').Count
-    if ($legacyCount -eq 0) { return }
-    if ($legacyCount -gt 5) {
-        throw "Unexpected GGML_TYPE_F16 usage count in flash_attn_cm1.comp: $legacyCount"
+    # flash_attn_cm1.comp includes flash_attn_base.glsl, where current mainline
+    # moved the stale host enum references. Repair both sources and verify that
+    # no generated shader can retain GGML_TYPE_F16.
+    $shaders = @(
+        "ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl",
+        "ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp"
+    )
+    $changed = @()
+    $legacyCount = 0
+    foreach ($shader in $shaders) {
+        if (-not (Test-Path $shader)) { continue }
+        $text = Get-Content $shader -Raw
+        $count = [regex]::Matches($text, '\bGGML_TYPE_F16\b').Count
+        $legacyCount += $count
+        if ($count -gt 0) {
+            Set-Content -Path $shader -Value $text.Replace('GGML_TYPE_F16', 'FA_TYPE_F16') -Encoding UTF8
+            $changed += $shader
+        }
     }
-
-    Set-Content -Path $shader -Value $text.Replace('GGML_TYPE_F16', 'FA_TYPE_F16') -Encoding UTF8
-    Invoke-Git add -- $shader
+    if ($legacyCount -eq 0) { return }
+    if ($legacyCount -gt 7) {
+        throw "Unexpected GGML_TYPE_F16 usage count in Vulkan flash-attention sources: $legacyCount"
+    }
+    foreach ($shader in $shaders) {
+        if ((Test-Path $shader) -and ((Get-Content $shader -Raw) -match '\bGGML_TYPE_F16\b')) {
+            throw "Vulkan flash-attention type-constant repair invariant failed: $shader"
+        }
+    }
+    foreach ($shader in $changed) { Invoke-Git add -- $shader }
     Invoke-Git commit -m "integration: use Vulkan flash-attention type constants"
-    Write-Host 'Replaced stale host enum references with shader-local FA_TYPE_F16 constants.'
+    Write-Host "Replaced $legacyCount stale host enum reference(s) with shader-local FA_TYPE_F16 constants."
 }
 
 if (Test-Path $Destination) {
@@ -479,7 +510,7 @@ try {
 
         Repair-FattnMergeDrift -FeatureSha $featureSha
         Repair-ModelHeaderMergeDrift
-        Repair-ModelApiMergeDrift -MainlineSha $mainlineSha
+        Repair-ModelApiMergeDrift -MainlineSha $mainlineSha -FeatureSha $featureSha
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-CudaFattnSharedMemory
