@@ -273,7 +273,7 @@ function Repair-MissingMainlineModelDeclarations {
             throw "Integrated source defines $name but mainline models.h has no declaration"
         }
         $open = $mainlineHeader.IndexOf('{', $start)
-        if ($open -lt 0) { throw "Cannot parse mainline declaration for $name: opening brace is missing" }
+        if ($open -lt 0) { throw "Cannot parse mainline declaration for ${name}: opening brace is missing" }
 
         $depth = 0
         $close = -1
@@ -284,9 +284,9 @@ function Repair-MissingMainlineModelDeclarations {
                 if ($depth -eq 0) { $close = $i; break }
             }
         }
-        if ($close -lt 0) { throw "Cannot parse mainline declaration for $name: closing brace is missing" }
+        if ($close -lt 0) { throw "Cannot parse mainline declaration for ${name}: closing brace is missing" }
         $end = $mainlineHeader.IndexOf(';', $close)
-        if ($end -lt 0) { throw "Cannot parse mainline declaration for $name: terminator is missing" }
+        if ($end -lt 0) { throw "Cannot parse mainline declaration for ${name}: terminator is missing" }
 
         $declaration = $mainlineHeader.Substring($start, $end - $start + 1)
         $modelsText = $modelsText.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $declaration + [Environment]::NewLine
