@@ -101,6 +101,49 @@ function Repair-UnorderedMapInclude {
 
 
 
+
+function Repair-MmvqMergeDrift {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FeatureSha
+    )
+
+    $mmvqCu = "ggml/src/ggml-cuda/mmvq.cu"
+    if (-not (Test-Path $mmvqCu)) {
+        return
+    }
+
+    $mmvqText = Get-Content $mmvqCu -Raw
+
+    # TurboQuant's feature translation unit carries the convrot/q8 reuse path.
+    # Current mainline carries a different MMVQ tuning rewrite (should_halve_iters).
+    # A textual three-way merge can retain both without conflict while destroying
+    # the surrounding function/switch structure. Treat that mixed state as semantic
+    # merge drift and keep the feature translation unit coherent.
+    $hasFeatureOwnedPath = $mmvqText -match '\bconvrot\b'
+    $hasMainlineRewrite  = $mmvqText -match '\bshould_halve_iters\b'
+
+    if (-not ($hasFeatureOwnedPath -and $hasMainlineRewrite)) {
+        return
+    }
+
+    Write-Host "Detected semantic merge drift in mmvq.cu (feature convrot path mixed with mainline MMVQ rewrite); restoring the feature-owned translation unit."
+    Invoke-Git checkout $FeatureSha -- $mmvqCu
+
+    & git diff --quiet $FeatureSha -- $mmvqCu
+    $featureDiffExit = $LASTEXITCODE
+    if ($featureDiffExit -eq 1) {
+        throw "Feature mmvq.cu invariant failed after restore: translation unit differs from feature source"
+    }
+    if ($featureDiffExit -ne 0) {
+        throw "git diff --quiet for restored mmvq.cu failed with exit code $featureDiffExit"
+    }
+
+    Invoke-Git add $mmvqCu
+    Invoke-Git commit -m "integration: keep feature mmvq translation unit coherent"
+    Write-Host "Applied semantic repair: kept TurboQuant mmvq.cu coherent instead of mixing incompatible mainline MMVQ rewrites."
+}
+
 function Repair-CublasHandleApiDrift {
     $mmvqTq = "ggml/src/ggml-cuda/mmvq-tq.cu"
     if (-not (Test-Path $mmvqTq)) {
@@ -232,6 +275,7 @@ try {
         }
 
         Repair-FattnMergeDrift -FeatureSha $featureSha
+        Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-UnorderedMapInclude
         Assert-CleanIntegration
