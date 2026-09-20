@@ -100,6 +100,41 @@ function Repair-UnorderedMapInclude {
 }
 
 
+
+function Repair-CublasHandleApiDrift {
+    $mmvqTq = "ggml/src/ggml-cuda/mmvq-tq.cu"
+    if (-not (Test-Path $mmvqTq)) {
+        return
+    }
+
+    $mmvqText = Get-Content $mmvqTq -Raw
+    $legacyPattern = 'ctx\.cublas_handle\(id\)'
+    $legacyCount = [regex]::Matches($mmvqText, $legacyPattern).Count
+    if ($legacyCount -eq 0) {
+        return
+    }
+
+    $setStreamPattern = 'cublasSetStream\s*\(\s*ctx\.cublas_handle\(id\)\s*,\s*stream\s*\)'
+    $gemmPattern = 'cublasGemmEx\s*\(\s*ctx\.cublas_handle\(id\)\s*,'
+    $setStreamCount = [regex]::Matches($mmvqText, $setStreamPattern).Count
+    $gemmCount = [regex]::Matches($mmvqText, $gemmPattern).Count
+
+    if (($legacyCount -ne 2) -or ($setStreamCount -ne 1) -or ($gemmCount -ne 1)) {
+        throw "Unexpected legacy cuBLAS handle shape in mmvq-tq.cu: total=$legacyCount, cublasSetStream=$setStreamCount, cublasGemmEx=$gemmCount"
+    }
+
+    $repairedText = $mmvqText.Replace("ctx.cublas_handle(id)", "ctx.cublas_handle()")
+    $remainingLegacyCount = [regex]::Matches($repairedText, $legacyPattern).Count
+    if ($remainingLegacyCount -ne 0) {
+        throw "cuBLAS handle repair invariant failed: $remainingLegacyCount legacy call(s) remain"
+    }
+
+    Set-Content -Path $mmvqTq -Value $repairedText -Encoding UTF8
+    Invoke-Git add $mmvqTq
+    Invoke-Git commit -m "integration: adapt TurboQuant cuBLAS handle calls to mainline"
+    Write-Host "Applied semantic repair: updated TurboQuant mmvq-tq.cu to the current zero-argument cublas_handle() API."
+}
+
 function Repair-FattnMergeDrift {
     param(
         [Parameter(Mandatory = $true)]
@@ -197,6 +232,7 @@ try {
         }
 
         Repair-FattnMergeDrift -FeatureSha $featureSha
+        Repair-CublasHandleApiDrift
         Repair-UnorderedMapInclude
         Assert-CleanIntegration
     }
