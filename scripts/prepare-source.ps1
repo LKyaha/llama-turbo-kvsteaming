@@ -237,6 +237,76 @@ function Repair-ModelHeaderMergeDrift {
     Write-Host 'Applied semantic repair for duplicate DFlash/K3 declarations and missing Spark2.5 model declaration.'
 }
 
+function Repair-MissingMainlineModelDeclarations {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MainlineSha
+    )
+
+    $modelsH = "src/models/models.h"
+    if (-not (Test-Path $modelsH)) { return }
+
+    # A feature-first merge can accept a new model .cpp without touching the
+    # heavily edited models.h.  Derive the required classes from the integrated
+    # sources, then copy only their exact declarations from the same mainline
+    # revision used for the merge.  This keeps model declarations and sources in
+    # lockstep without replacing feature-owned declarations.
+    $mainlineHeaderLines = @(& git show "${MainlineSha}:src/models/models.h")
+    if ($LASTEXITCODE -ne 0) { throw "Cannot read mainline models.h at $MainlineSha" }
+    $mainlineHeader = $mainlineHeaderLines -join [Environment]::NewLine
+    $modelsText = Get-Content $modelsH -Raw
+
+    $sourceNames = @(
+        Get-ChildItem -Path "src/models" -Filter "*.cpp" | ForEach-Object {
+            [regex]::Matches((Get-Content $_.FullName -Raw), '\b(llama_model_[A-Za-z0-9_]+)::') |
+                ForEach-Object { $_.Groups[1].Value }
+        } | Sort-Object -Unique
+    )
+
+    $added = @()
+    foreach ($name in $sourceNames) {
+        $declPattern = "(?m)^\s*struct\s+$([regex]::Escape($name))\s*:"
+        if ($modelsText -match $declPattern) { continue }
+
+        $start = $mainlineHeader.IndexOf("struct $name")
+        if ($start -lt 0) {
+            throw "Integrated source defines $name but mainline models.h has no declaration"
+        }
+        $open = $mainlineHeader.IndexOf('{', $start)
+        if ($open -lt 0) { throw "Cannot parse mainline declaration for $name: opening brace is missing" }
+
+        $depth = 0
+        $close = -1
+        for ($i = $open; $i -lt $mainlineHeader.Length; $i++) {
+            if ($mainlineHeader[$i] -eq '{') { $depth++ }
+            elseif ($mainlineHeader[$i] -eq '}') {
+                $depth--
+                if ($depth -eq 0) { $close = $i; break }
+            }
+        }
+        if ($close -lt 0) { throw "Cannot parse mainline declaration for $name: closing brace is missing" }
+        $end = $mainlineHeader.IndexOf(';', $close)
+        if ($end -lt 0) { throw "Cannot parse mainline declaration for $name: terminator is missing" }
+
+        $declaration = $mainlineHeader.Substring($start, $end - $start + 1)
+        $modelsText = $modelsText.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $declaration + [Environment]::NewLine
+        $added += $name
+    }
+
+    if ($added.Count -gt 0) {
+        Set-Content -Path $modelsH -Value $modelsText -Encoding UTF8
+        Invoke-Git add -- $modelsH
+        Invoke-Git commit -m "integration: restore missing mainline model declarations"
+        Write-Host "Restored model declarations from mainline: $($added -join ', ')."
+    }
+
+    $finalHeader = Get-Content $modelsH -Raw
+    $missing = @($sourceNames | Where-Object { $finalHeader -notmatch "(?m)^\s*struct\s+$([regex]::Escape($_))\s*:" })
+    if ($missing.Count -gt 0) {
+        throw "Integrated model source(s) still lack declarations: $($missing -join ', ')"
+    }
+}
+
 function Repair-MmvqMergeDrift {
     param(
         [Parameter(Mandatory = $true)]
@@ -545,6 +615,7 @@ try {
 
         Repair-FattnMergeDrift -FeatureSha $featureSha
         Repair-ModelHeaderMergeDrift
+        Repair-MissingMainlineModelDeclarations -MainlineSha $mainlineSha
         Repair-ModelApiMergeDrift -MainlineSha $mainlineSha -FeatureSha $featureSha
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
