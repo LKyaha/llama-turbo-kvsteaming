@@ -102,7 +102,6 @@ function Repair-UnorderedMapInclude {
 
 
 
-
 function Remove-LaterDuplicateLines {
     param(
         [Parameter(Mandatory = $true)]
@@ -3571,22 +3570,23 @@ finally {
     if (Test-Path $modelsH) {
         $modelsText = Get-Content $modelsH -Raw
         if ($modelsText -notmatch '(?m)^\s*struct\s+llama_model_spark2_5\s*:') {
-            $sparkDecl = @'
-struct llama_model_spark2_5 : public llama_model_base {
-    llama_model_spark2_5(const struct llama_model_params & params) : llama_model_base(params) {}
-    void load_arch_hparams(llama_model_loader & ml) override;
-    void load_arch_tensors(llama_model_loader & ml) override;
-
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
-    };
-
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
-};
-
-'@
-            $markerText = "struct llm_build_eagle3_encode"
-            $markerIndex = $modelsText.IndexOf($markerText)
+            $sparkLines = @(
+                'struct llama_model_spark2_5 : public llama_model_base {',
+                '    llama_model_spark2_5(const struct llama_model_params & params) : llama_model_base(params) {}',
+                '    void load_arch_hparams(llama_model_loader & ml) override;',
+                '    void load_arch_tensors(llama_model_loader & ml) override;',
+                '',
+                '    struct graph : public llm_graph_context {',
+                '        graph(const llama_model & model, const llm_graph_params & params);',
+                '    };',
+                '',
+                '    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;',
+                '};',
+                ''
+            )
+            $sparkDecl = $sparkLines -join [Environment]::NewLine
+            $featureHelperMarker = 'struct llm_build_eagle3_encode'
+            $markerIndex = $modelsText.IndexOf($featureHelperMarker)
             if ($markerIndex -ge 0) {
                 $modelsText = $modelsText.Insert($markerIndex, $sparkDecl)
             }
@@ -3595,7 +3595,7 @@ struct llama_model_spark2_5 : public llama_model_base {
             }
             Set-Content -Path $modelsH -Value $modelsText -Encoding UTF8
             $changed += $modelsH
-            Write-Host "Restored llama_model_spark2_5 declaration lost by the feature-first merge."
+            Write-Host 'Restored llama_model_spark2_5 declaration lost by the feature-first merge.'
         }
     }
 
@@ -3608,9 +3608,8 @@ struct llama_model_spark2_5 : public llama_model_base {
         Invoke-Git add -- $path
     }
     Invoke-Git commit -m "integration: repair model header merge drift"
-    Write-Host "Applied semantic repair for DFlash/K3 header duplication and Spark2.5 declaration loss."
+    Write-Host 'Applied semantic repair for duplicate DFlash/K3 declarations and missing Spark2.5 model declaration.'
 }
-
 
 function Repair-MmvqMergeDrift {
     param(
