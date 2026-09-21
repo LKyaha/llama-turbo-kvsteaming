@@ -1,62 +1,2114 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 7656cabc6..6c8099cf2 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -999,1755 +999,6 @@ std::string common_chat_template_generation_prompt(
+     return common_chat_template_generation_prompt_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+ }
+ 
+-static common_chat_params common_chat_params_init_ministral_3(const common_chat_template &    tmpl,
+-                                                              const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    // Build up messages to follow the format: https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512/blob/main/chat_template.jinja
+-    auto adjusted_messages = json::array();
+-    for (const auto & msg : inputs.messages) {
+-        auto role = msg.value("role", "");
+-        if (role != "system" && role != "assistant") {
+-            // Only adjust system and assistant messages. Interestingly, the system message may contain thinking.
+-            adjusted_messages.push_back(msg);
+-            continue;
+-        }
+-
+-        auto content = json::array();
+-
+-        // If message contains `reasoning_content`, add it as a block of type `thinking`
+-        if (msg.contains("reasoning_content") && msg.at("reasoning_content").is_string()) {
+-            content.push_back({
+-                { "type",     "thinking"                                     },
+-                { "thinking", msg.at("reasoning_content").get<std::string>() },
+-            });
+-        }
+-
+-        // If message contains `content`, add it as a block of type `text`
+-        if (msg.contains("content")) {
+-            if (msg.at("content").is_string()) {
+-                content.push_back({
+-                    { "type", "text"                               },
+-                    { "text", msg.at("content").get<std::string>() },
+-                });
+-            } else if (msg.at("content").is_array()) {
+-                auto blocks = msg.at("content");
+-                content.insert(content.end(), blocks.begin(), blocks.end());
+-            }
+-        }
+-
+-        auto adjusted       = msg;
+-        adjusted["content"] = content;
+-        adjusted.erase("reasoning_content");
+-        adjusted_messages.push_back(adjusted);
+-    }
+-
+-    auto has_tools            = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format  = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+-    auto extract_reasoning    = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar      = true;
+-
+-    data.supports_thinking  = true;
+-    data.thinking_start_tag = "[THINK]";
+-    data.thinking_end_tags  = {"[/THINK]"};
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.preserved_tokens  = {
+-        "[THINK]",
+-        "[/THINK]",
+-        "[TOOL_CALLS]",
+-        "[ARGS]",
+-    };
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = "[THINK]" + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "[/THINK]" + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.eps();
+-        auto reasoning =
+-            extract_reasoning ? p.optional("[THINK]" + p.reasoning(p.until("[/THINK]")) + "[/THINK]") : p.eps();
+-
+-        // Response format parser
+-        if (has_response_format) {
+-            // Ministral wants to emit json surrounded by code fences
+-            return generation_prompt + (reasoning << "```json" << p.content(p.schema(p.json(), "response-format", inputs.json_schema)) << "```");
+-        }
+-
+-        // Tool call parser
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            auto tool_choice = p.choice();
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                std::string  name     = function.at("name");
+-                const auto & schema   = function.at("parameters");
+-
+-                tool_choice |=
+-                    p.rule("tool-" + name, p.tool_open(p.tool_name(p.literal(name)) + "[ARGS]") +
+-                                               p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)));
+-            });
+-
+-            auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+-            auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+-            auto tool_calls = p.trigger_rule("tool-call", p.repeat("[TOOL_CALLS]" + tool_choice, min_calls, max_calls));
+-
+-            return generation_prompt + (reasoning << p.content(p.until("[TOOL_CALLS]")) << tool_calls);
+-        }
+-
+-        // Content only parser
+-        include_grammar = false;
+-        return generation_prompt + (reasoning << p.content(p.rest()));
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-
+-        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "[TOOL_CALLS]" }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
+-                                                              const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    const std::string GEN_PREFIX = "<|im_start|>assistant\n";
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-
+-    auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;
+-
+-    data.supports_thinking = supports_reasoning;
+-    data.preserved_tokens  = {
+-        "<tool_call>",
+-        "</tool_call>",
+-    };
+-
+-    if (supports_reasoning) {
+-        data.thinking_start_tag = "<think>";
+-        // Support both </think> and <tool_call> as reasoning end sequences.
+-        // <function= is omitted, as it is a workaround for Qwen3-Coder which is not a thinking model
+-        data.thinking_end_tags = { "</think>", "<tool_call>" };
+-        data.preserved_tokens.insert(data.preserved_tokens.end(), { "<think>", "</think>" });
+-    }
+-
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, "<|im_start|>assistant"             },
+-        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>user\n<tool_response>" }, // Qwen3-Coder, Qwen3.5, Nemotron Nano 3
+-        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>tool_response"         }, // StepFun-3.5-Flash
+-        { COMMON_CHAT_ROLE_USER,      "<|im_start|>user"                  },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "<|im_start|>system"                },
+-    };
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = GEN_PREFIX;
+-        if (supports_reasoning) {
+-            data.generation_prompt += "<think>\n" + msg.reasoning_content;
+-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += "\n</think>\n\n";
+-            }
+-        }
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.literal(GEN_PREFIX);
+-
+-        auto reasoning = p.eps();
+-        if (supports_reasoning && extract_reasoning) {
+-            reasoning = p.optional("<think>" + p.space() +
+-                                   p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
+-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+-        }
+-
+-        // Response format parser
+-        if (has_response_format) {
+-            return generation_prompt + (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
+-        }
+-
+-        // Tool call parser
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+-            auto arg_string = p.rule("xml-arg-string",
+-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+-
+-            auto tool_choice = p.choice();
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function   = tool.at("function");
+-                std::string  name       = function.at("name");
+-                auto         parameters = function.contains("parameters") ? function.at("parameters") : json::object();
+-
+-                auto schema_info = common_schema_info();
+-                schema_info.resolve_refs(parameters);
+-
+-                std::vector<common_peg_parser> required_args;
+-                std::vector<common_peg_parser> optional_args;
+-
+-                foreach_parameter(function, [&](const std::string & param_name, const json & param_schema, bool is_required) {
+-                    auto rule_name = "tool-" + name + "-arg-" + param_name;
+-
+-                    auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
+-
+-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
+-                        arg_string :
+-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+-
+-                    auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
+-
+-                    (is_required ? required_args : optional_args).push_back(arg_rule);
+-                });
+-
+-                // Accept required arguments in any order, as Qwen does not always adhere to the
+-                // order provided.
+-                auto args = p.permute("tool-" + name + "-args", required_args);
+-                if (!optional_args.empty()) {
+-                    args = args + p.zero_or_more(p.choice(optional_args));
+-                }
+-
+-                auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
+-                                   p.tool_args(args) +
+-                                   p.tool_close(p.literal("</function>\n")));
+-
+-                tool_choice |= p.rule("tool-" + name, func);
+-            });
+-
+-            auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+-
+-            // Qwen3-Coder models may occasionally omit the <tool_call> token.
+-            auto tool_call_body  = tool_choice + "</tool_call>" + p.space();
+-            auto tool_call_first = p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body);
+-            auto tool_call       = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+-
+-            auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
+-            auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
+-
+-            return generation_prompt +
+-                   (reasoning << p.content(p.until_one_of({ "<tool_call>", "<function=" })) << tool_calls);
+-        }
+-
+-        // Content only parser
+-        return generation_prompt + (reasoning << p.content(p.rest()));
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-
+-        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        if (data.grammar_lazy) {
+-            data.grammar_triggers = {
+-                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<tool_call>" },
+-                // Trigger on "<function" and not "<function=" because the trailing "=" is part of
+-                // the token with the function name e.g. "=read"
+-                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<function"   },
+-            };
+-        }
+-    }
+-
+-    return data;
+-}
+-
+-static common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &    tmpl,
+-                                                          const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    // Copy reasoning to the "thinking" field as expected by the gpt-oss template
+-    auto adjusted_messages = json::array();
+-    for (auto msg : inputs.messages) {
+-        if (msg.contains("reasoning_content") && msg.at("reasoning_content").is_string()) {
+-            msg["thinking"] = msg.at("reasoning_content");
+-            if (msg.contains("tool_calls") && msg.at("tool_calls").is_array() && !msg.at("tool_calls").empty()) {
+-                msg.erase("content");
+-            }
+-        }
+-        adjusted_messages.push_back(msg);
+-    }
+-
+-    auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+-
+-    // Check if we need to replace the return token with end token during
+-    // inference and without generation prompt. For more details see:
+-    // https://github.com/ggml-org/llama.cpp/issues/15417
+-    if (inputs.is_inference && !inputs.add_generation_prompt) {
+-        static constexpr std::string_view return_token = "<|return|>";
+-        static constexpr std::string_view end_token    = "<|end|>";
+-        if (size_t pos = prompt.rfind(return_token); pos != std::string::npos) {
+-            prompt.replace(pos, return_token.length(), end_token);
+-        }
+-    }
+-
+-    data.prompt            = prompt;
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
+-        { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "<|start|>developer" },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "<|start|>system"    },
+-        { COMMON_CHAT_ROLE_TOOL,      "<|start|>functions" },
+-    };
+-
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = true;
+-
+-    data.thinking_start_tag = "<|channel|>analysis<|message|>";
+-    data.thinking_end_tags  = {"<|end|>"};
+-
+-    // These special tokens are required to parse properly, so we include them
+-    // even if parse_tool_calls is false.
+-    data.preserved_tokens = {
+-        "<|channel|>", "<|constrain|>", "<|message|>", "<|start|>", "<|end|>",
+-    };
+-
+-    // Adjust prompt for continuation
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = "<|start|>assistant<|channel|>analysis<|message|>" + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto start           = p.rule("start", p.literal("<|start|>assistant"));
+-        auto end             = p.rule("end", p.literal("<|end|>"));
+-        auto content         = p.rule("message-content", p.until("<|end|>"));
+-        auto channel         = p.literal("<|channel|>") + (p.literal("commentary") | p.literal("analysis"));
+-        auto constrain_type  = p.chars("[A-Za-z0-9_-]", 1, -1);
+-
+-        // Occasionally, gpt-oss-20b will prefix channels with this commentary
+-        auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + p.optional(p.literal(" to=assistant")));
+-        auto start_analysis = stray_commentary + p.literal("<|channel|>analysis<|message|>");
+-
+-        if (extract_reasoning) {
+-            p.rule("analysis", start_analysis + p.reasoning(content) + end);
+-        } else {
+-            p.rule("analysis", p.content(start_analysis + content + end));
+-        }
+-
+-        auto analysis = p.ref("analysis");
+-        auto preamble = p.rule("preamble", p.literal("<|channel|>commentary<|message|>") + p.content(content) + end);
+-        auto final_msg = p.rule("final", stray_commentary + p.literal("<|channel|>final<|message|>") + p.content(content));
+-
+-        // Consume any unsolicited tool calls, e.g. builtin functions
+-        auto unsolicited = p.rule("unsolicited", p.atomic(p.optional(channel) + p.literal(" to=") + content + end));
+-
+-        auto any = p.rule("any", preamble | analysis);
+-
+-        if (has_response_format) {
+-            auto constraint = p.optional(p.space() + p.optional(p.literal("<|constrain|>")) + constrain_type);
+-            auto response_format = p.rule("response-format",
+-                p.literal("<|channel|>final") + constraint + p.literal("<|message|>") +
+-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
+-
+-            return p.zero_or_more(start + analysis) + start + response_format;
+-        }
+-
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            auto tool_choice = p.choice();
+-
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                std::string  name     = function.at("name");
+-                const auto & params   = function.at("parameters");
+-
+-                auto func_name  = p.literal(" to=functions.") + p.tool_name(p.literal(name));
+-                auto constraint = p.optional(p.space() + p.optional(p.literal("<|constrain|>")) + constrain_type);
+-                auto args       = p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", params));
+-
+-                // recipient in role header
+-                //   <|start|>assistant to=functions.NAME<|channel|>(commentary|analysis)[constraint]<|message|>ARGS
+-                auto tool_in_role = p.tool(p.tool_open(func_name + channel + constraint + p.literal("<|message|>")) + args);
+-
+-                // recipient in channel header
+-                //   <|channel|>(commentary|analysis) to=functions.NAME[constraint]<|message|>ARGS
+-                auto tool_in_channel = p.tool(p.tool_open(channel + func_name + constraint + p.literal("<|message|>")) + args);
+-
+-                tool_choice |= p.rule("tool-" + name, tool_in_role | tool_in_channel);
+-            });
+-
+-            auto tool_call  = p.trigger_rule("tool-call", tool_choice);
+-
+-            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+-                return p.zero_or_more(start + any) + start + tool_call;
+-            }
+-
+-            return p.zero_or_more(start + any) + start + (tool_call | final_msg);
+-        }
+-
+-        return p.zero_or_more(start + any) + start + (final_msg | unsolicited);
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "^\\s+to$" },
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "^<\\|channel\\|>(?:commentary|analysis)\\s+to=functions$" },
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|start\\|>assistant(\\s+to)" },
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|start\\|>assistant(<\\|channel\\|>(?:commentary|analysis)\\s+to)" }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-static common_chat_params common_chat_params_init_gemma4(const common_chat_template &    tmpl,
+-                                                         const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-
+-    if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
+-        // This may happen if the model generates content + tool_call, the
+-        // template does not add the model's next turn and confuses the model
+-        // from emitting its proper reasoning token sequence.
+-        data.generation_prompt = "<|turn>model\n";
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_USER,      "<|turn>user"  },
+-        { COMMON_CHAT_ROLE_ASSISTANT, "<|turn>model" },
+-    };
+-
+-    data.format            = COMMON_CHAT_FORMAT_PEG_GEMMA4;
+-    data.supports_thinking  = true;
+-    data.thinking_start_tag = "<|channel>thought";
+-    data.thinking_end_tags  = {"<channel|>"};
+-
+-    data.preserved_tokens = {
+-        "<|channel>",
+-        "<channel|>",
+-        "<|tool_call>",
+-        "<tool_call|>",
+-        "<|turn>",
+-    };
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
+-        data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<channel|>" + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto start = p.rule("start", p.optional(p.literal("<|turn>model\n")));
+-
+-        if (extract_reasoning) {
+-            p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(p.until("<channel|>")) + p.literal("<channel|>"));
+-        } else {
+-            p.rule("thought", p.content(p.literal("<|channel>thought") + p.space() + p.until("<channel|>") + p.literal("<channel|>")));
+-        }
+-
+-        auto consume_empty_channels = p.gbnf(p.zero_or_more(p.literal("<|channel>") + p.negate(p.literal("thought"))), "");
+-        auto thought = (p.peek(p.literal("<|channel>")) + consume_empty_channels + p.ref("thought")) | p.negate(p.literal("<|channel>"));
+-
+-        if (has_response_format) {
+-            auto response_format = p.literal("```json") <<
+-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) <<
+-                p.literal("```");
+-            return start + p.optional(thought) + response_format;
+-        }
+-
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            // Gemma4 tool calling syntax
+-            // Rules should match traversal logic in gemma4_to_json()
+-            p.rule("gemma4-string-content", p.until("<|\"|>"));
+-            p.rule("gemma4-string", p.literal("<|\"|>") + p.ref("gemma4-string-content") + p.literal("<|\"|>"));
+-            p.rule("gemma4-bool", p.json_bool());
+-            p.rule("gemma4-null", p.json_null());
+-            p.rule("gemma4-number", p.json_number());
+-            p.rule("gemma4-dict-key", p.rule("gemma4-dict-key-name", p.chars("[^:}]", 1, -1)) + p.literal(":"));
+-            p.rule("gemma4-dict-kv", p.ref("gemma4-dict-key") + p.space() + p.ref("gemma4-value"));
+-            p.rule("gemma4-dict", [&]() {
+-                auto ws = p.space();
+-                auto member = p.ref("gemma4-dict-kv");
+-                auto members = p.sequence({member, p.zero_or_more(p.sequence({p.literal(","), ws, member}))});
+-                return p.sequence({
+-                    p.literal("{"), ws,
+-                    p.choice({p.literal("}"), p.sequence({members, ws, p.literal("}")})})
+-                });
+-            });
+-            p.rule("gemma4-array", [&]() {
+-                auto ws = p.space();
+-                auto value = p.ref("gemma4-value");
+-                auto elements = p.sequence({value, p.zero_or_more(p.sequence({p.literal(","), ws, value}))});
+-                return p.sequence({
+-                    p.literal("["), ws,
+-                    p.choice({p.literal("]"), p.sequence({elements, ws, p.literal("]")})})
+-                });
+-            });
+-            p.rule("gemma4-value", [&]() {
+-                return p.choice({
+-                    p.ref("gemma4-string"), p.ref("gemma4-dict"), p.ref("gemma4-array"),
+-                    p.ref("gemma4-number"), p.ref("gemma4-bool"), p.ref("gemma4-null")
+-                });
+-            });
+-
+-            auto tool_choice = p.choice();
+-
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                std::string  name     = function.at("name");
+-                // TODO @aldehir : need to extend json-schema-to-grammar to produce more than JSON rules
+-                // const auto & params   = function.at("parameters");
+-
+-                tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
+-                    p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
+-                    p.tool_args(p.ref("gemma4-dict")),
+-                })));
+-            });
+-
+-            auto tool_call = p.trigger_rule("tool-call", p.repeat(
+-                "<|tool_call>call:" + tool_choice + "<tool_call|>",
+-                /* min = */ inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0,
+-                /* max = */ inputs.parallel_tool_calls ? -1 : 1
+-            ));
+-
+-            auto scan_to_toolcall = p.rule("scan-to-toolcall", p.until("<|tool_call>"));
+-            auto content = p.rule("content", p.content(p.until_one_of({"<|channel>", "<channel|>", "<|tool_call>"})));
+-            auto message = p.rule("message", thought + content);
+-            return start + p.zero_or_more(message) + scan_to_toolcall + tool_call;
+-        }
+-
+-        // Gemma 4 may emit an extra <|channel>thought\n<channel|> at the end of the content. It may
+-        // also emit a single trailing <channel|> token. Consume all complete reasoning blocks and
+-        // then stop at the first unmatched <channel|> token.
+-        auto content = p.rule("content", p.content(p.until_one_of({"<|channel>", "<channel|>"})));
+-        auto message = p.rule("message", thought + content);
+-        return start + p.one_or_more(message);
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call>" },
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-// Functionary v3.2 - uses recipient-based format: >>>recipient\n{content}
+-static common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_template &    tmpl,
+-                                                                   const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.preserved_tokens  = {
+-        ">>>all",
+-    };
+-
+-    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-        data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        // Functionary v3.2 format:
+-        // - Normal content: >>>all\n{content}
+-        // - Tool calls: >>>function_name\n{json_args}
+-        // Generation prompt ends with ">>>" so model outputs recipient immediately
+-
+-        // Build content parser for >>>all\n{content}
+-        // When tools are present, content stops before the next ">>>" (tool call)
+-        // When no tools, content goes until end
+-        auto content_until_tool = p.literal("all\n") + p.content(p.until(">>>"));
+-        auto content_until_end  = p.literal("all\n") + p.content(p.rest());
+-        auto generation_prompt  = p.literal("<|start_header_id|>assistant<|end_header_id|>\n\n>>>");
+-
+-        // If no tools or tool_choice is NONE, just parse content
+-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            // When no tools, just match the prefix and capture everything after
+-            return generation_prompt + content_until_end + p.end();
+-        }
+-
+-        // Build tool call parsers for each available function
+-        auto tool_choice = p.choice();
+-        foreach_function(inputs.tools, [&](const json & tool) {
+-            const auto & function = tool.at("function");
+-            std::string  name     = function.at("name");
+-            const auto & schema   = function.at("parameters");
+-
+-            // Tool format: >>>function_name\n{json_args}
+-            auto tool_parser = p.tool(
+-                p.tool_open(p.tool_name(p.literal(name)) + p.literal("\n")) +
+-                p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema))
+-            );
+-
+-            tool_choice |= p.rule("tool-" + name, tool_parser);
+-        });
+-
+-        auto content_only = content_until_end;
+-        auto tools_only = p.trigger_rule("tools", p.one_or_more(tool_choice));
+-        auto content_and_tools = content_until_tool + tools_only;
+-
+-        auto ret = p.eps();
+-        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+-            if (inputs.parallel_tool_calls) {
+-                ret = p.choice({ content_and_tools, tools_only }) + p.end();
+-            } else {
+-                ret = p.choice({ content_until_tool + tool_choice, tools_only }) + p.end();
+-            }
+-        } else if (inputs.parallel_tool_calls) {
+-            ret = p.choice({ content_and_tools, content_only, tools_only }) + p.end();
+-        } else {
+-            auto content_and_tool = content_until_tool + tool_choice;
+-            ret = p.choice({ content_and_tool, content_only, tool_choice }) + p.end();
+-        }
+-        return generation_prompt + ret;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-
+-        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        // Grammar trigger for when the model starts outputting a tool call
+-        // (after the initial ">>>" in the generation prompt but recipient other than "all")
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, ">>>(?!all)" }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-// Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
+-// The ID contains both the function name and an incrementing counter
+-static common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &    tmpl,
+-                                                          const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = true;
+-    data.preserved_tokens  = {
+-        "<|tool_calls_section_begin|>",
+-        "<|tool_calls_section_end|>",
+-        "<|tool_call_begin|>",
+-        "<|tool_call_argument_begin|>",
+-        "<|tool_call_end|>",
+-        "<think>",
+-        "</think>",
+-    };
+-
+-    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-
+-    const std::string SECTION_BEGIN = "<|tool_calls_section_begin|>";
+-    const std::string SECTION_END   = "<|tool_calls_section_end|>";
+-    const std::string CALL_BEGIN    = "<|tool_call_begin|>";
+-    const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
+-    const std::string CALL_END      = "<|tool_call_end|>";
+-
+-    const std::string THINK_START = "<think>";
+-    const std::string THINK_END   = "</think>";
+-    const std::string GEN_PROMPT  = "<|im_assistant|>assistant<|im_middle|>";
+-
+-    data.thinking_start_tag = THINK_START;
+-    data.thinking_end_tags  = {THINK_END};
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        // Kimi K2 Thinking format:
+-        // - Reasoning: <think>{reasoning}</think>
+-        // - Content: text after reasoning
+-        // - Tool calls section:
+-        //   <|tool_calls_section_begin|>
+-        //   <|tool_call_begin|>functions.<name>:<index><|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+-        //   ...
+-        //   <|tool_calls_section_end|>
+-        // The ID format is: functions.<function_name>:<counter> where counter is 0, 1, 2, ...
+-
+-        // Tool call markers
+-        auto end = p.end();
+-
+-        // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
+-        // For example, it can call tools at the end of reasoning without closing reasoning...
+-        auto reasoning = extract_reasoning ? p.optional(p.space() + THINK_START + p.reasoning(
+-            p.until_one_of({ THINK_END, "<|tool_calls_section_begin|>", "<|tool_call_begin|>" })) +
+-            p.optional(p.literal(THINK_END))) : p.eps();
+-        auto generation_prompt = p.literal(GEN_PROMPT);
+-
+-
+-        // Content only parser (no tools)
+-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            return generation_prompt + reasoning + p.content(p.rest()) + end;
+-        }
+-
+-        // Build tool call parsers for each available function
+-        // The ID format is: functions.<name>:<index>
+-        // We need to match: functions.<name>:<digits>
+-        auto tool_choice = p.choice();
+-        foreach_function(inputs.tools, [&](const json & tool) {
+-            const auto & function = tool.at("function");
+-            std::string  name     = function.at("name");
+-            const auto & schema   = function.at("parameters");
+-
+-            // Match: functions.<name>:<digits>
+-            // Capture the full call id (functions.<name>:<digits>) using tool_id tag
+-            auto tool_id = p.tool_id(p.literal("functions.") + p.tool_name(p.literal(name)) + p.literal(":") + p.chars("[0-9]", 1, -1));
+-            auto tool_parser = p.tool(
+-                p.tool_open(tool_id + p.literal(ARGS_BEGIN)) +
+-                p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)) +
+-                p.tool_close(p.optional((p.literal(CALL_END))))
+-            );
+-
+-            tool_choice |= p.rule("tool-" + name, tool_parser);
+-        });
+-
+-        // Tool calls section: <|tool_calls_section_begin|> tool_calls <|tool_calls_section_end|>
+-        auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+-        auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+-        // Use trigger_rule so grammar generator knows where to start generating rules
+-        auto tool_calls = p.rule("tool-calls",
+-            p.optional(p.literal(SECTION_BEGIN)) +
+-            p.trigger_rule("tool-call", p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) +
+-                p.optional(p.literal(SECTION_END)))
+-        );
+-
+-        auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
+-
+-        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call_begin|>" }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-// LFM2/LFM2.5 parser. Tool calls are almost Python-style and parallel-capable
+-// (except dotted names and JSON literals true/false/null).
+-// Always wrapped in <|tool_call_start|>[name(args)]<|tool_call_end|> with optional <think> reasoning.
+-// tool_list_tokens preserves LFM2 system tool-list markers.
+-static common_chat_params common_chat_params_init_lfm2(const common_chat_template &          tmpl,
+-                                                       const autoparser::generation_params & inputs,
+-                                                       bool tool_list_tokens) {
+-    common_chat_params data;
+-
+-    const std::string TOOL_CALL_START = "<|tool_call_start|>";
+-    const std::string TOOL_CALL_END   = "<|tool_call_end|>";
+-    const std::string TOOL_LIST_START = "<|tool_list_start|>";
+-    const std::string TOOL_LIST_END   = "<|tool_list_end|>";
+-    const std::string THINK_START     = "<think>";
+-    const std::string THINK_END       = "</think>";
+-    const std::string GEN_PROMPT      = "<|im_start|>assistant\n";
+-
+-    // Copy reasoning to the "thinking" field the template expects
+-    auto adjusted_messages = json::array();
+-    for (auto msg : inputs.messages) {
+-        if (msg.contains("reasoning_content") && msg.at("reasoning_content").is_string()) {
+-            msg["thinking"] = msg.at("reasoning_content");
+-        }
+-        adjusted_messages.push_back(msg);
+-    }
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = true;
+-    data.preserved_tokens  = { TOOL_CALL_START, TOOL_CALL_END, THINK_START, THINK_END };
+-    if (tool_list_tokens) {
+-        data.preserved_tokens.push_back(TOOL_LIST_START);
+-        data.preserved_tokens.push_back(TOOL_LIST_END);
+-    }
+-
+-    data.thinking_start_tag = THINK_START;
+-    data.thinking_end_tags  = {THINK_END};
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+-    // Gate by reasoning format and whether the template supports <think>
+-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE &&
+-                             tmpl.source().find(THINK_START) != std::string::npos;
+-    auto include_grammar   = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.literal(GEN_PROMPT);
+-        auto end = p.end();
+-
+-        auto reasoning = p.eps();
+-        if (extract_reasoning) {
+-            // Allow optional whitespace before <think> — some models emit a
+-            // newline between the generation prompt and the thinking tag.
+-            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+-        }
+-
+-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            if (has_response_format) {
+-                auto response_format = p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema));
+-                return generation_prompt + reasoning + response_format + end;
+-            }
+-            return generation_prompt + reasoning + p.content(p.rest()) + end;
+-        }
+-        auto tool_calls = p.rule("tool-calls",
+-            p.trigger_rule("tool-call",
+-                p.literal(TOOL_CALL_START) +
+-                p.python_style_tool_calls(inputs.tools, inputs.parallel_tool_calls, /* allow_json_literals = */ true) +
+-                p.literal(TOOL_CALL_END)
+-            )
+-        );
+-
+-        auto content = p.content(p.until(TOOL_CALL_START));
+-
+-        return generation_prompt + reasoning + content + tool_calls + end;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_CALL_START }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-static common_chat_params common_chat_params_init_gigachat_v3(
+-        const common_chat_template & tmpl,
+-        const autoparser::generation_params & inputs) {
+-
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = false;
+-    data.preserved_tokens  = {
+-        "<|message_sep|>\n\n",
+-        "<|role_sep|>\n",
+-    };
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-        data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-    const auto *tool_call_start_prefix = "<|message_sep|>\n\nfunction call<|role_sep|>\n";
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto ret = p.eps();
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            // Build a choice of all available tools
+-            auto tool_choice = p.choice();
+-            for (const auto & tool : inputs.tools) {
+-                const auto & function = tool.at("function");
+-                std::string name = function.at("name");
+-                const auto & schema = function.at("parameters");
+-
+-                auto tool_name = p.json_member("name", "\"" + p.tool_name(p.literal(name)) + "\"");
+-                auto tool_args = p.json_member("arguments", p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", schema)));
+-
+-                auto tool_open = p.tool_open(p.literal("{") << tool_name);
+-
+-                tool_choice |= p.rule("tool-" + name, tool_open << "," << tool_args << "}");
+-            }
+-
+-            // Define the tool call structure
+-            auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+-            auto max_calls = 1; // parallel toolcalls are not supported
+-            auto tool_call = p.rule("tool-call", p.literal(tool_call_start_prefix) + tool_choice);
+-            auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(tool_call, /* min = */ min_calls, /* max = */ max_calls));
+-
+-            ret = p.content(p.until("<|message_sep|>\n\n")) << tool_calls;
+-        } else {
+-            // Content only parser
+-            include_grammar = false;
+-            ret = p.content(p.rest());
+-        }
+-
+-        return p.literal("assistant<|role_sep|>\n") + ret;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-
+-        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto schema = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            {COMMON_GRAMMAR_TRIGGER_TYPE_WORD, tool_call_start_prefix}
+-        };
+-    }
+-    return data;
+-}
+-
+-// The DeepSeek V4 reference implementation renders consecutive tool results into a single
+-// user block, ordered by the tool call order of the preceding assistant message (matched
+-// by tool call id) rather than by the order they appear in the conversation.
+-static json deepseek_v4_sort_tool_results(const json & messages) {
+-    json adjusted = messages;
+-    std::map<std::string, size_t> call_order;
+-
+-    for (size_t i = 0; i < adjusted.size();) {
+-        const auto & msg  = adjusted[i];
+-        const auto   role = msg.value("role", "");
+-
+-        if (role == "assistant" && msg.contains("tool_calls") &&
+-                msg.at("tool_calls").is_array() && !msg.at("tool_calls").empty()) {
+-            call_order.clear();
+-            const auto & tool_calls = msg.at("tool_calls");
+-            for (size_t idx = 0; idx < tool_calls.size(); idx++) {
+-                auto id = tool_calls[idx].value("id", "");
+-                if (!id.empty()) {
+-                    call_order[id] = idx;
+-                }
+-            }
+-            i++;
+-            continue;
+-        }
+-
+-        if (role != "user" && role != "tool") {
+-            i++;
+-            continue;
+-        }
+-
+-        // collect a maximal run of user/tool messages - they render into one user block
+-        std::vector<size_t> tool_positions;
+-        size_t run_end = i;
+-        for (; run_end < adjusted.size(); run_end++) {
+-            const auto r = adjusted[run_end].value("role", "");
+-            if (r == "tool") {
+-                tool_positions.push_back(run_end);
+-            } else if (r != "user") {
+-                break;
+-            }
+-        }
+-
+-        if (tool_positions.size() > 1 && !call_order.empty()) {
+-            std::vector<json> results;
+-            results.reserve(tool_positions.size());
+-            for (auto pos : tool_positions) {
+-                results.push_back(adjusted[pos]);
+-            }
+-            std::stable_sort(results.begin(), results.end(), [&](const json & a, const json & b) {
+-                const auto order = [&](const json & m) {
+-                    auto it = call_order.find(m.value("tool_call_id", ""));
+-                    return it == call_order.end() ? (size_t) 0 : it->second;
+-                };
+-                return order(a) < order(b);
+-            });
+-            for (size_t k = 0; k < tool_positions.size(); k++) {
+-                adjusted[tool_positions[k]] = std::move(results[k]);
+-            }
+-        }
+-
+-        i = run_end;
+-    }
+-
+-    return adjusted;
+-}
+-
+-static common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_template &    tmpl,
+-                                                                 const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    // V4 uses the same DSML markup as V3.2, but names the tool call block "tool_calls"
+-    // instead of "function_calls", renders tool results in tool call order and its
+-    // non-thinking generation prompt ends with a bare </think> instead of an empty
+-    // <think></think> pair.
+-    const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+-
+-    std::optional<json> adjusted_messages;
+-    if (is_v4) {
+-        adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
+-    }
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    std::optional<json> additional_context;
+-    if (is_v4 && has_response_format) {
+-        additional_context = json{ { "response_format", inputs.json_schema } };
+-    }
+-
+-    const std::string DSML         = "｜DSML｜";
+-    const std::string THINK_START  = "<think>";
+-    const std::string THINK_END    = "</think>";
+-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
+-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
+-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
+-    const std::string INVOKE_START = "<" + DSML + "invoke";
+-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
+-    const std::string PARAM_START  = "<" + DSML + "parameter";
+-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+-    const std::string GEN_PROMPT   = "<｜Assistant｜>";
+-    const std::string TC_SEPARATOR = "\n\n";
+-
+-    data.prompt = common_chat_template_direct_apply_impl(
+-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(
+-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+-    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking  = true;
+-    data.thinking_start_tag = THINK_START;
+-    data.thinking_end_tags  = {THINK_END, FC_START};
+-    data.preserved_tokens   = {
+-        DSML,
+-        THINK_START,
+-        THINK_END,
+-    };
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        if (is_v4 && msg.reasoning_content.empty()) {
+-            data.generation_prompt = GEN_PROMPT + THINK_END;
+-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += msg.render_content();
+-            }
+-        } else {
+-            data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += THINK_END + msg.render_content();
+-            }
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-    bool has_tool_calls = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.literal(GEN_PROMPT);
+-        auto end               = p.end();
+-
+-        // build tool call section first since we might need it in reasoning
+-        auto tool_choice = p.choice();
+-        if (has_tool_calls) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                std::string  name     = function.at("name");
+-                auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                const auto & props    = params.contains("properties") ? params.at("properties") : json::object();
+-
+-                std::set<std::string> required;
+-                if (params.contains("required")) {
+-                    params.at("required").get_to(required);
+-                }
+-
+-                auto schema_info = common_schema_info();
+-                schema_info.resolve_refs(params);
+-
+-                std::vector<common_peg_parser> required_parsers;
+-                std::vector<common_peg_parser> optional_parsers;
+-                for (const auto & [param_name, param_schema] : props.items()) {
+-                    bool is_required = required.find(param_name) != required.end();
+-                    bool is_string   = schema_info.resolves_to_string(param_schema);
+-
+-                    auto arg = p.tool_arg(
+-                        p.tool_arg_open(p.literal(PARAM_START + " name=\"") + p.tool_arg_name(p.literal(param_name)) +
+-                                        p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
+-                        (is_string ?
+-                             p.tool_arg_string_value(p.until(PARAM_END)) :
+-                             p.tool_arg_json_value(p.schema(p.json(), "tool-" + name + "-arg-" + param_name + "-schema",
+-                                                            param_schema, false))) +
+-                        p.tool_arg_close(p.literal(PARAM_END)));
+-
+-                    auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
+-                    if (is_required) {
+-                        required_parsers.push_back(named_arg);
+-                    } else {
+-                        optional_parsers.push_back(named_arg);
+-                    }
+-                }
+-
+-                common_peg_parser args_seq = p.eps();
+-                for (size_t i = 0; i < required_parsers.size(); i++) {
+-                    if (i > 0) {
+-                        args_seq = args_seq + p.space();
+-                    }
+-                    args_seq = args_seq + required_parsers[i];
+-                }
+-
+-                if (!optional_parsers.empty()) {
+-                    common_peg_parser any_opt = p.choice();
+-                    for (const auto & opt : optional_parsers) {
+-                        any_opt |= opt;
+-                    }
+-                    args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+-                }
+-
+-                common_peg_parser invoke_body = args_seq;
+-                auto              func_parser = p.tool(p.tool_open(p.literal(INVOKE_START + " name=\"") +
+-                                                                   p.tool_name(p.literal(name)) + p.literal("\">\n")) +
+-                                                       invoke_body + p.space() + p.tool_close(p.literal(INVOKE_END)));
+-
+-                tool_choice |= p.rule("tool-" + name, func_parser);
+-            });
+-        }
+-
+-        common_peg_parser tool_calls = p.eps();
+-        if (inputs.parallel_tool_calls) {
+-            tool_calls = p.trigger_rule("tool-call",
+-                p.literal(FC_START) + p.space() + tool_choice +
+-                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
+-        } else {
+-            tool_calls = p.trigger_rule("tool-call",
+-                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
+-        }
+-
+-        auto reasoning = p.eps();
+-        auto reasoning_with_tc = p.eps();
+-        auto obligatory_tool_calls = tool_calls;
+-        bool allow_reasoning_with_tc = false;
+-
+-        if (!require_tools) {
+-            tool_calls = p.optional(tool_calls);
+-        }
+-
+-        if (extract_reasoning && inputs.enable_thinking) {
+-            // Allow optional whitespace before <think> — some models emit a
+-            // newline between the generation prompt and the thinking tag.
+-            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+-            reasoning_with_tc = THINK_START +
+-                p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
+-                p.space() + obligatory_tool_calls;
+-            allow_reasoning_with_tc = true;
+-        } else if (extract_reasoning) {
+-            // Thinking disabled but reasoning extraction requested: the generation prompt
+-            // contains an empty <think></think> pair (V3.2) or a bare </think> (V4) that
+-            // must still be consumed.
+-            reasoning = is_v4
+-                ? p.optional(p.literal(THINK_END))
+-                : p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+-        }
+-
+-        if (has_response_format) {
+-            auto response_format = p.rule("response-format",
+-                p.literal("```json") + p.space() +
+-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
+-                p.space() + p.literal("```"));
+-            return generation_prompt + reasoning + response_format + end;
+-        }
+-
+-        if (!has_tool_calls) {
+-            return generation_prompt + reasoning + p.content(p.rest()) + end;
+-        }
+-
+-        auto content_before_tools = p.negate(p.literal(THINK_START)) +
+-            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) +
+-            p.space();
+-        return allow_reasoning_with_tc ? generation_prompt + (reasoning_with_tc | (reasoning + content_before_tools + tool_calls)) + end :
+-            generation_prompt + reasoning + content_before_tools + tool_calls + end;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = has_tools && !require_tools;
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-// Cohere2 MoE (a.k.a. "North Code") parser.
+-//
+-// The assistant turn is fully marker-wrapped:
+-//   <|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>
+-//     <|START_THINKING|>{reasoning}<|END_THINKING|>
+-//     then EITHER content:    <|START_TEXT|>{content}<|END_TEXT|>
+-//          OR     tool calls: <|START_ACTION|>[
+-//                                 {"tool_call_id": "0", "tool_name": "f", "parameters": {...}}, ...
+-//                             ]<|END_ACTION|>
+-//   <|END_OF_TURN_TOKEN|>
+-//
+-// The generation prompt forces a leading <|START_THINKING|> (when reasoning is enabled, which is
+-// the template default), so the model's output continues from *inside* the thinking block. The
+-// parser literal therefore only covers the stable <|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|> prefix
+-// and the reasoning rule consumes the <|START_THINKING|> ... <|END_THINKING|> markers itself,
+-// regardless of whether they came from the generation prompt or the generated text.
+-static common_chat_params common_chat_params_init_cohere2moe(const common_chat_template &          tmpl,
+-                                                              const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    const std::string TURN_START    = "<|START_OF_TURN_TOKEN|>";
+-    const std::string TURN_END      = "<|END_OF_TURN_TOKEN|>";
+-    const std::string CHATBOT       = "<|CHATBOT_TOKEN|>";
+-    const std::string USER          = "<|USER_TOKEN|>";
+-    const std::string SYSTEM        = "<|SYSTEM_TOKEN|>";
+-    const std::string THINK_START   = "<|START_THINKING|>";
+-    const std::string THINK_END     = "<|END_THINKING|>";
+-    const std::string TEXT_START    = "<|START_TEXT|>";
+-    const std::string TEXT_END      = "<|END_TEXT|>";
+-    const std::string ACTION_START  = "<|START_ACTION|>";
+-    const std::string ACTION_END    = "<|END_ACTION|>";
+-    const std::string RESULT_START  = "<|START_TOOL_RESULT|>";
+-    const std::string RESULT_END    = "<|END_TOOL_RESULT|>";
+-
+-    // Stable prefix of the generation prompt that precedes the (forced) <|START_THINKING|> marker.
+-    const std::string GEN_PREFIX = TURN_START + CHATBOT;
+-
+-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking  = true;
+-    data.thinking_start_tag = THINK_START;
+-    data.thinking_end_tags  = {THINK_END};
+-    data.preserved_tokens   = {
+-        TURN_START, TURN_END, CHATBOT, USER, SYSTEM,
+-        THINK_START, THINK_END,
+-        TEXT_START, TEXT_END,
+-        ACTION_START, ACTION_END,
+-        RESULT_START, RESULT_END,
+-    };
+-
+-    // Declare per-role message delimiters. Tool results are rendered with the
+-    // system token followed by <|START_TOOL_RESULT|>, so the "tool" delimiter must be listed before
+-    // the plain "system" one (it is a strict superset, and the role split tries delimiters in order).
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PREFIX },
+-        { COMMON_CHAT_ROLE_USER,      TURN_START + USER },
+-        { COMMON_CHAT_ROLE_TOOL,      TURN_START + SYSTEM + RESULT_START },
+-        { COMMON_CHAT_ROLE_SYSTEM,    TURN_START + SYSTEM },
+-    };
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.literal(GEN_PREFIX);
+-        auto end               = p.end();
+-
+-        // The thinking block is always present (the generation prompt forces <|START_THINKING|>).
+-        // When extracting reasoning, capture its body; otherwise keep the whole block (markers
+-        // included) inline as content, matching reasoning_format=NONE conventions.
+-        common_peg_parser reasoning = p.eps();
+-        if (extract_reasoning) {
+-            reasoning = p.optional(p.literal(THINK_START) +
+-                                   p.reasoning(p.until_one_of({ THINK_END, TEXT_START, ACTION_START })) +
+-                                   p.optional(p.literal(THINK_END)));
+-        } else {
+-            reasoning = p.optional(p.content(p.literal(THINK_START) +
+-                                             p.until_one_of({ THINK_END, TEXT_START, ACTION_START }) +
+-                                             p.optional(p.literal(THINK_END))));
+-        }
+-
+-        auto text_content = has_response_format
+-            ? p.literal(TEXT_START) +
+-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
+-                p.optional(p.literal(TEXT_END))
+-            : p.literal(TEXT_START) + p.content(p.until(TEXT_END)) + p.optional(p.literal(TEXT_END));
+-
+-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            return generation_prompt + reasoning + text_content + p.optional(p.literal(TURN_END)) + end;
+-        }
+-
+-        auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-
+-        // <|START_ACTION|>[ {"tool_call_id": "0", "tool_name": "f", "parameters": {...}}, ... ]<|END_ACTION|>
+-        auto tool_calls = p.standard_json_tools(ACTION_START, ACTION_END, inputs.tools, inputs.parallel_tool_calls,
+-                                                /* force_tool_calls = */ true,
+-                                                /* name_key         = */ "tool_name",
+-                                                /* args_key         = */ "parameters",
+-                                                /* array_wrapped    = */ true,
+-                                                /* function_is_key  = */ false,
+-                                                /* call_id_key      = */ "",
+-                                                /* gen_call_id_key  = */ "tool_call_id",
+-                                                /* parameters_order = */ { "tool_call_id", "tool_name", "parameters" });
+-
+-        // Content and tool calls are mutually exclusive in this format.
+-        common_peg_parser body = require_tools ? tool_calls : p.choice({ tool_calls, text_content });
+-
+-        return generation_prompt + reasoning + body + p.optional(p.literal(TURN_END)) + end;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.at("parameters");
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, ACTION_START }
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-static common_chat_params common_chat_params_init_minimax_m3(const common_chat_template &          tmpl,
+-                                                             const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format             = COMMON_CHAT_FORMAT_PEG_MINIMAX_M3;
+-    data.supports_thinking  = true;
+-    data.thinking_start_tag = "<mm:think>";
+-    data.thinking_end_tags  = {"</mm:think>"};
+-
+-    // M3 prefixes every tool tag with the namespace token "]<]minimax[>[";
+-    // params use the parameter name as the tag (<file_path>...</file_path>).
+-    const std::string NS          = "]<]minimax[>[";
+-    const std::string THINK_START = "<mm:think>";
+-    const std::string THINK_END   = "</mm:think>";
+-    const std::string FC_START    = NS + "<tool_call>";
+-    const std::string FC_END      = NS + "</tool_call>";
+-    const std::string INVOKE_END  = NS + "</invoke>";
+-
+-    data.preserved_tokens = {
+-        NS,
+-        "<tool_call>",
+-        "</tool_call>",
+-        THINK_START,
+-        THINK_END,
+-    };
+-
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, "]~b]ai"        },
+-        { COMMON_CHAT_ROLE_USER,      "]~b]user"      },
+-        { COMMON_CHAT_ROLE_TOOL,      "]~b]tool"      },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "]~b]developer" },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "]~b]system"    },
+-    };
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    const std::string GEN_PROMPT = data.generation_prompt;
+-
+-    using mm3 = common_chat_peg_minimax_m3_mapper;
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.prefix(GEN_PROMPT, THINK_START);
+-        auto end = p.end();
+-
+-        auto reasoning = p.eps();
+-        if (extract_reasoning) {
+-            auto block = inputs.enable_thinking
+-                             ? p.literal(THINK_START) + p.space() +
+-                                   p.ac(p.reasoning(p.until(THINK_END)) + p.literal(THINK_END), THINK_END)
+-                             : p.literal(THINK_START) + p.ac(p.until(THINK_END) + p.literal(THINK_END), THINK_END);
+-
+-            // A turn without reasoning is prefixed with a bare </mm:think>, written either by the
+-            // generation prompt (thinking_mode = "disabled") or by the model itself.
+-            reasoning = p.optional(p.choice({ block, p.literal(THINK_END) }));
+-        }
+-
+-        if (has_response_format) {
+-            auto response_format = p.rule("response-format",
+-                p.literal("```json") + p.space() +
+-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
+-                p.space() + p.literal("```"));
+-            return generation_prompt + reasoning + response_format + end;
+-        }
+-
+-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            return generation_prompt + reasoning + p.content(p.rest()) + end;
+-        }
+-
+-        auto alternatives_of = [](const json & schema) -> std::optional<json> {
+-            for (const auto * keyword : { "oneOf", "anyOf" }) {
+-                if (schema.contains(keyword) && schema.at(keyword).is_array() && !schema.at(keyword).empty()) {
+-                    return schema.at(keyword);
+-                }
+-            }
+-            return std::nullopt;
+-        };
+-
+-        auto tool_choice = p.choice();
+-        foreach_function(inputs.tools, [&](const json & tool) {
+-            const auto & function = tool.at("function");
+-            std::string  name     = function.at("name");
+-            auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+-
+-            auto schema_info = common_schema_info();
+-            schema_info.resolve_refs(params);
+-
+-            // The template expands argument values recursively in XML (see the to_xml() macro)
+-            std::function<common_peg_parser(const json &, const std::string &, const std::string &)> value_of;
+-            std::function<common_peg_parser(const json &, const std::string &)>                      members_of;
+-
+-            auto element_of = [&](const std::string & tag, const json & schema, const std::string & rule_name) {
+-                const std::string close = NS + "</" + tag + ">";
+-                return p.rule(rule_name,
+-                    p.tool_arg(
+-                        p.tool_arg_open(
+-                            p.literal(NS + "<") +
+-                            p.tool_arg_name(p.literal(tag)) +
+-                            p.literal(">")) +
+-                        value_of(schema, rule_name, close)));
+-            };
+-
+-            value_of = [&](const json & schema,
+-                           const std::string & rule_name,
+-                           const std::string & close) -> common_peg_parser {
+-                auto close_tag = p.tool_arg_close(p.literal(close));
+-
+-                // A string accepts anything, so a union with a string alternative is a string
+-                if (schema_info.resolves_to_string(schema)) {
+-                    return p.ac(p.tool_arg_string_value(p.until(close)) + close_tag, close);
+-                }
+-
+-                if (auto alternatives = alternatives_of(schema)) {
+-                    std::vector<common_peg_parser> choices;
+-
+-                    size_t index = 0;
+-                    for (const auto & alternative : *alternatives) {
+-                        const std::string alt_name = rule_name + "-" + std::to_string(index++);
+-
+-                        // There is a risk that this breaks streaming deltas, but that's a risk we
+-                        // assume to provide tool arg streaming.
+-                        choices.push_back(value_of(alternative, alt_name, close));
+-                    }
+-
+-                    return p.choice(choices);
+-                }
+-
+-                const std::string type = schema.contains("type") && schema.at("type").is_string()
+-                                             ? schema.at("type").get<std::string>()
+-                                             : "";
+-
+-                if (type == "object" && schema.contains("properties")) {
+-                    return p.tag(mm3::TOOL_ARG_OBJECT, members_of(schema, rule_name)) + p.space() + close_tag;
+-                }
+-
+-                if (type == "array" && schema.contains("items")) {
+-                    const std::string item_close = NS + "</item>";
+-                    auto item = p.rule(rule_name + "-item",
+-                        p.tag(mm3::TOOL_ARG_ITEM,
+-                              p.literal(NS + "<item>") +
+-                                  value_of(schema.at("items"), rule_name + "-item", item_close)));
+-                    return p.tag(mm3::TOOL_ARG_ARRAY, p.repeat(p.space() + item, 0, -1)) + p.space() + close_tag;
+-                }
+-
+-                return p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", schema, false)) + close_tag;
+-            };
+-
+-            // Required properties in schema order, then any number of optional ones in any order.
+-            members_of = [&](const json & schema, const std::string & rule_prefix) -> common_peg_parser {
+-                const auto & props = schema.at("properties");
+-
+-                std::set<std::string> required;
+-                if (schema.contains("required")) {
+-                    schema.at("required").get_to(required);
+-                }
+-
+-                std::vector<common_peg_parser> required_elements;
+-                std::vector<common_peg_parser> optional_elements;
+-                for (const auto & [key, key_schema] : props.items()) {
+-                    auto element = element_of(key, key_schema, rule_prefix + "-" + key);
+-                    if (required.find(key) != required.end()) {
+-                        required_elements.push_back(element);
+-                    } else {
+-                        optional_elements.push_back(element);
+-                    }
+-                }
+-
+-                common_peg_parser members = p.eps();
+-                for (size_t i = 0; i < required_elements.size(); i++) {
+-                    if (i > 0) {
+-                        members = members + p.space();
+-                    }
+-                    members = members + required_elements[i];
+-                }
+-
+-                if (!optional_elements.empty()) {
+-                    common_peg_parser any_optional = p.choice();
+-                    for (const auto & element : optional_elements) {
+-                        any_optional |= element;
+-                    }
+-                    members = members + p.repeat(p.space() + any_optional, 0, -1);
+-                }
+-
+-                return members;
+-            };
+-
+-            common_peg_parser invoke_body =
+-                params.contains("properties") ? members_of(params, "tool-" + name + "-arg") : p.eps();
+-
+-            auto func_parser = p.tool(
+-                p.tool_open(p.literal(NS + "<invoke name=\"") +
+-                            p.tool_name(p.literal(name)) + p.literal("\">")) +
+-                p.space() + invoke_body + p.space() +
+-                p.tool_close(p.literal(INVOKE_END)));
+-
+-            tool_choice |= p.rule("tool-" + name, func_parser);
+-        });
+-
+-        auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-
+-        common_peg_parser tool_calls = p.eps();
+-        if (inputs.parallel_tool_calls) {
+-            tool_calls = p.trigger_rule("tool-call",
+-                p.literal(FC_START) + p.space() + tool_choice +
+-                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
+-        } else {
+-            tool_calls = p.trigger_rule("tool-call",
+-                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
+-        }
+-
+-        if (!require_tools) {
+-            tool_calls = p.optional(tool_calls);
+-        }
+-
+-        auto content_before_tools = p.content(p.until(FC_START));
+-        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+-        };
+-    }
+-
+-    return data;
+-}
+-
+ namespace workaround {
+ 
+ static void map_developer_role_to_system(json & messages) {
+@@ -2826,294 +1077,6 @@ static void trim_all_content(std::vector<common_chat_msg> & messages) {
+ 
+ }
+ 
+-// MiniCPM5 format:
+-// - Reasoning: <think>{reasoning}</think> (optional)
+-// - Tool calls: <function name="foo"><param name="bar">value</param></function>
+-static common_chat_params common_chat_params_init_minicpm5(const common_chat_template &          tmpl,
+-                                                           const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = true;
+-    data.preserved_tokens  = {
+-        "<function",
+-        "<param",
+-        "</function>",
+-        "</param>",
+-        "<think>",
+-        "</think>",
+-    };
+-
+-    data.thinking_start_tag = "<think>";
+-    data.thinking_end_tags  = {"</think>"};
+-
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, "<|im_start|>assistant"             },
+-        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>user\n<tool_response>" },
+-        { COMMON_CHAT_ROLE_USER,      "<|im_start|>user"                  },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "<|im_start|>system"                },
+-    };
+-
+-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+-    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = "<|im_start|>assistant\n<think>\n" + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "\n</think>\n\n" + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto generation_prompt = p.literal("<|im_start|>assistant\n");
+-
+-        auto reasoning = p.eps();
+-        if (extract_reasoning) {
+-            reasoning = ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space();
+-        }
+-
+-        // Response format parser
+-        if (has_response_format) {
+-            return generation_prompt + reasoning + p.content(p.schema(p.json(), "response-format", inputs.json_schema));
+-        }
+-
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            // CDATA lets a value carry characters that would otherwise close the tag (e.g.
+-            // </param>); capture the inner text only, excluding the CDATA markers.
+-            auto string_value = p.choice({
+-                p.literal("<![CDATA[") + p.ac(p.tool_arg_string_value(p.until("]]>")) + p.literal("]]>"), "]]>") + p.tool_arg_close(p.literal("</param>")),
+-                p.negate(p.literal("<![CDATA[")) + p.ac(p.tool_arg_string_value(p.until("</param>")) + p.tool_arg_close(p.literal("</param>")), "</param>")
+-            });
+-
+-            auto tool_choice = p.choice();
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto &      function = tool.at("function");
+-                const std::string name     = function.at("name");
+-                auto              params   = function.contains("parameters") ? function.at("parameters") : json::object();
+-
+-                auto args = p.eps();
+-                if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
+-                    auto schema_info = common_schema_info();
+-                    schema_info.resolve_refs(params);
+-
+-                    auto arg_choice = p.choice();
+-                    for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
+-                        auto value_parser = p.eps();
+-                        if (schema_info.resolves_to_string(prop_schema)) {
+-                            value_parser = string_value;
+-                        } else {
+-                            value_parser = p.tool_arg_json_value(
+-                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false)
+-                                ) + p.tool_arg_close(p.literal("</param>"));
+-                        }
+-
+-                        auto arg_rule = p.tool_arg(
+-                            p.tool_arg_open(p.literal("<param name=\"") + p.tool_arg_name(p.literal(prop_name)) + p.literal("\">")) +
+-                            value_parser
+-                        );
+-
+-                        arg_choice |= arg_rule;
+-                    }
+-                    args = p.zero_or_more(arg_choice + p.space());
+-                }
+-
+-                auto tool_parser = p.tool(
+-                    p.tool_open(p.literal("<function name=\"") + p.tool_name(p.literal(name)) + p.literal("\">"))
+-                    << p.tool_args(args)
+-                    << p.tool_close(p.literal("</function>")));
+-
+-                tool_choice |= p.rule("tool-" + name, tool_parser);
+-            });
+-
+-            auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+-            auto tool_calls = p.trigger_rule("tool-call", p.repeat(tool_choice + p.space(), 1, max_calls));
+-
+-            auto content = p.content(p.until("<function"));
+-
+-            return generation_prompt + reasoning + content + tool_calls + p.end();
+-        }
+-
+-        return generation_prompt + reasoning + p.content(p.rest()) + p.end();
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                builder.resolve_refs(schema);
+-            });
+-            if (has_response_format) {
+-                auto schema = inputs.json_schema;
+-                builder.resolve_refs(schema);
+-            }
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<function" },
+-        };
+-    }
+-
+-    return data;
+-}
+-
+-// An assistant turn is rendered as one or more messages, each
+-// "<|start|>assistant to=<recipient><|message|>{content}{END}" where END is
+-// <|eom|> (more messages follow) or <|eot|> (end of turn):
+-//   - chain-of-thought: to=self, terminated by <|eom|>
+-//   - final answer:     to=user, terminated by <|eot|>
+-// The generation prompt is just "<|start|>assistant"; the model emits its own
+-// " to=...<|message|>".
+-static common_chat_params common_chat_params_init_muse_glimmer(const common_chat_template &          tmpl,
+-                                                               const autoparser::generation_params & inputs) {
+-    common_chat_params data;
+-
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = "<|start|>assistant";
+-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+-    data.supports_thinking = true;
+-
+-    data.preserved_tokens = {
+-        "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
+-        // ATEM tool-call markup emitted on " to=<tool>" turns.
+-        "<atem:function_calls>", "<atem:invoke", "<atem:parameter", "</atem:parameter>",
+-        "</atem:invoke>", "</atem:function_calls>",
+-    };
+-
+-    data.message_delimiters = {
+-        { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
+-        { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },
+-        { COMMON_CHAT_ROLE_SYSTEM,    "<|start|>system"    },
+-        { COMMON_CHAT_ROLE_TOOL,      "<|start|>tool"      },
+-    };
+-
+-    if (inputs.has_continuation()) {
+-        const auto & msg = inputs.continue_msg;
+-
+-        data.generation_prompt = "<|start|>assistant to=self<|message|>" + msg.reasoning_content;
+-        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
+-        }
+-
+-        data.prompt += data.generation_prompt;
+-    }
+-
+-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+-
+-    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+-    // Constrained grammar whenever tools are offered.
+-    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-
+-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+-        auto start = p.rule("start", p.literal("<|start|>assistant"));
+-
+-        if (!extract_reasoning && !include_grammar) {
+-            return start + p.content(p.rest());
+-        }
+-
+-        if (extract_reasoning) {
+-            p.rule("analysis", p.literal(" to=self<|message|>") + p.reasoning(p.until("<|eom|>")) + p.literal("<|eom|>"));
+-        } else {
+-            p.rule("analysis", p.literal(" to=self<|message|>") + p.content(p.until("<|eom|>")) + p.literal("<|eom|>"));
+-        }
+-        auto analysis = p.ref("analysis");
+-
+-        auto recipient  = p.optional(p.literal(" to=user"));
+-        auto final_msg  = p.rule("final", recipient + p.literal("<|message|>") + p.content(p.until("<|eot|>")));
+-
+-        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            auto string_value = p.ac(
+-                p.tool_arg_string_value(p.until("</atem:parameter>")) + p.tool_arg_close(p.literal("</atem:parameter>")),
+-                "</atem:parameter>");
+-
+-            auto tool_choice = p.choice();
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto &      function = tool.at("function");
+-                const std::string name     = function.at("name");
+-                auto              params   = function.contains("parameters") ? function.at("parameters") : json::object();
+-
+-                auto args = p.eps();
+-                if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
+-                    auto schema_info = common_schema_info();
+-                    schema_info.resolve_refs(params);
+-
+-                    auto arg_choice = p.choice();
+-                    for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
+-                        auto value_parser = p.eps();
+-                        if (schema_info.resolves_to_string(prop_schema)) {
+-                            value_parser = string_value;
+-                        } else {
+-                            value_parser = p.tool_arg_json_value(
+-                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false))
+-                                + p.tool_arg_close(p.literal("</atem:parameter>"));
+-                        }
+-
+-                        auto arg_rule = p.tool_arg(
+-                            p.tool_arg_open(p.literal("<atem:parameter name=\"") + p.tool_arg_name(p.literal(prop_name)) + p.literal("\">")) +
+-                            value_parser);
+-
+-                        arg_choice |= arg_rule;
+-                    }
+-                    args = p.zero_or_more(arg_choice + p.space());
+-                }
+-
+-                auto tool_parser = p.tool(
+-                    p.tool_open(p.literal(" to=") + p.until("<|message|>") +
+-                                p.literal("<|message|><atem:function_calls>") + p.space() +
+-                                p.literal("<atem:invoke name=\"") + p.tool_name(p.literal(name)) + p.literal("\">") + p.space())
+-                    << p.tool_args(args)
+-                    << p.tool_close(p.literal("</atem:invoke>") + p.space() + p.literal("</atem:function_calls>")));
+-
+-                tool_choice |= p.rule("tool-" + name, tool_parser);
+-            });
+-
+-            auto tool_calls = inputs.parallel_tool_calls
+-                ? p.trigger_rule("tool-call", tool_choice + p.zero_or_more(p.literal("<|eom|>") + start + tool_choice))
+-                : p.trigger_rule("tool-call", tool_choice);
+-
+-
+-            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+-                return p.zero_or_more(start + analysis) + start + tool_calls;
+-            }
+-            return p.zero_or_more(start + analysis) + start + (tool_calls | final_msg);
+-        }
+-
+-        return p.zero_or_more(start + analysis) + start + final_msg;
+-    });
+-
+-    data.parser = parser.save();
+-
+-    if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+-            foreach_function(inputs.tools, [&](const json & tool) {
+-                const auto & function = tool.at("function");
+-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+-                builder.resolve_refs(schema);
+-            });
+-            parser.build_grammar(builder, data.grammar_lazy);
+-        });
+-        data.grammar_triggers = {
+-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN,
+-              "<\\|start\\|>assistant( to=(?!self<\\|message\\|>)(?!user<\\|message\\|>)[^<]*?<\\|message\\|>)" },
+-        };
+-    }
+-
+-    return data;
+-}
+-
+ static json common_chat_extra_context() {
+     json ctx = json::object();
+     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
 diff --git a/common/common.cpp b/common/common.cpp
-index d8319cd9a..e55f04f5d 100644
+index 394137f7c..739af2043 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1320,6 +1320,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
-         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-             params.tensor_split,
-             params.tensor_buft_overrides.data(),
-+            &params.moe_cache,
+@@ -1321,7 +1321,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             &params.moe_cache,
              params.fit_params_target.data(),
              params.fit_params_min_ctx,
-             has_draft || spec_mtp ? &extra : nullptr,
-@@ -1687,7 +1688,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
-     mparams.main_gpu        = params.main_gpu;
-     mparams.split_mode      = params.split_mode;
-     mparams.load_mode       = params.load_mode;
--    mparams.lazy_mode = params.lazy_mode;
-+    mparams.tensor_read_lazy = params.tensor_read_lazy;
-     mparams.tensor_split    = params.tensor_split;
-     mparams.check_tensors   = params.check_tensors;
-     mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1722,7 +1723,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
-     cparams.n_seq_max         = params.n_parallel;
+-            has_draft || spec_mtp ? &extra : nullptr,
++            nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
+             throw std::runtime_error(
+@@ -1754,7 +1754,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.gdn_replay        = params.gdn_replay;
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
 -    cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
++    cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 1);
      cparams.n_batch           = params.n_batch;
      cparams.n_ubatch          = params.n_ubatch;
-     cparams.n_threads         = params.cpuparams.n_threads;
+ 
 diff --git a/common/common.h b/common/common.h
-index e3f306296..eca4cd651 100644
+index eca4cd651..17796c0c9 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -509,8 +509,6 @@ struct common_params {
-     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
- 
--    enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
--
-     enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
- 
-     common_cpu_params cpuparams;
+@@ -481,6 +481,7 @@ struct common_params {
+     bool    n_parallel_explicit   = false; // true if -np/--parallel was passed on the command line
+     int32_t n_sequences           =     1; // number of sequences to decode
+     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
++    int32_t n_outputs_max_per_seq =     1; // max outputs a backend sampler retains per sequence
+     bool    gdn_replay            = false; // DRC: ingredient-replay rollback for GDN models instead of full K-snapshots [EXPERIMENTAL]
+     int32_t grp_attn_n            =     1; // group-attention factor
+     int32_t grp_attn_w            =   512; // group-attention width
 diff --git a/common/fit.cpp b/common/fit.cpp
-index faa595f84..d5175bc43 100644
+index 5fc0532e2..d5175bc43 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
-@@ -1,9 +1,11 @@
+@@ -1,20 +1,24 @@
  #include "fit.h"
  
-+#include "common.h"
- #include "json.h"
+ #include "common.h"
++#include "json.h"
  #include "log.h"
  
+-#include "../ggml/src/ggml-backend-moe-cache.h"
  #include "../src/llama-ext.h"
 +#include "../ggml/src/ggml-backend-moe-cache.h"
  
+-#include <algorithm>
  #include <array>
  #include <cassert>
-@@ -13,6 +15,10 @@
++#include <stdexcept>
+ #include <cinttypes>
+ #include <set>
+-#include <stdexcept>
  #include <string>
  #include <vector>
  
@@ -67,65 +2119,439 @@ index faa595f84..d5175bc43 100644
  // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
  // enum to identify part of a layer for distributing its tensors:
  enum common_layer_fraction_t {
-@@ -27,6 +33,8 @@ class common_params_fit_exception : public std::runtime_error {
+@@ -29,275 +33,7 @@ class common_params_fit_exception : public std::runtime_error {
      using std::runtime_error::runtime_error;
  };
  
+-const char * common_moe_cache_tensor_override_pattern() {
+-    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+-}
+-
+-struct common_moe_cache_fit_pool {
+-    ggml_type type = GGML_TYPE_COUNT;
+-    size_t expert_size = 0;
+-    size_t pool_bytes = 0;
+-    size_t tensor_bytes = 0;
+-    size_t scratch_bytes = 0;
+-};
+-
+-common_moe_cache_fit_result common_moe_cache_plan_fit(
+-        const std::vector<common_moe_cache_fit_device_input> & device_inputs,
+-        const std::vector<common_moe_cache_fit_shape_input> & shapes,
+-        size_t reserve_bytes,
+-        size_t budget_bytes,
+-        int min_devices,
+-        size_t minimum_slab_bytes) {
+-    common_moe_cache_fit_result result;
+-
+-    for (const common_moe_cache_fit_device_input & input : device_inputs) {
+-        if (input.physical_device < 0 || input.free_bytes < 0 || input.used_bytes > INT64_MAX) {
+-            result.reason = "device memory accounting overflowed";
+-            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-            return result;
+-        }
+-
+-        size_t device_index = result.devices.size();
+-        for (size_t candidate = 0; candidate < result.devices.size(); candidate++) {
+-            if (result.devices[candidate].physical_device == input.physical_device) {
+-                device_index = candidate;
+-                break;
+-            }
+-        }
+-        if (device_index == result.devices.size()) {
+-            common_moe_cache_fit_device device;
+-            device.physical_device = input.physical_device;
+-            device.compute_capability = input.compute_capability;
+-            device.free_bytes = input.free_bytes;
+-            result.devices.push_back(device);
+-        }
+-
+-        common_moe_cache_fit_device & device = result.devices[device_index];
+-        device.free_bytes = std::min(device.free_bytes, input.free_bytes);
+-        device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+-        if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
+-            result.reason = "device memory accounting overflowed";
+-            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-            return result;
+-        }
+-        device.used_bytes += (int64_t)input.used_bytes;
+-    }
+-    if (result.devices.empty()) {
+-        result.reason = "no selected device satisfies the cache hardware policy";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-
+-    for (common_moe_cache_fit_device & device : result.devices) {
+-        const int64_t projected_free = device.free_bytes - device.used_bytes;
+-        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+-            continue;
+-        }
+-        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+-        if (budget_bytes > 0) {
+-            device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
+-        }
+-    }
+-
+-    std::vector<common_moe_cache_fit_pool> pools;
+-    for (const common_moe_cache_fit_shape_input & shape : shapes) {
+-        if (shape.tensor_bytes == 0 || shape.tensor_bytes > SIZE_MAX - result.expert_bytes) {
+-            result.reason = "the routed expert tensor inventory overflowed";
+-            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-            return result;
+-        }
+-        result.expert_bytes += shape.tensor_bytes;
+-        if (!shape.cacheable) {
+-            continue;
+-        }
+-        bool found = false;
+-        for (common_moe_cache_fit_pool & pool : pools) {
+-            if (pool.type == shape.type && pool.expert_size == shape.expert_size) {
+-                pool.pool_bytes = std::max(pool.pool_bytes, shape.pool_bytes);
+-                pool.tensor_bytes += shape.tensor_bytes;
+-                pool.scratch_bytes = std::max(pool.scratch_bytes, shape.scratch_bytes);
+-                found = true;
+-                break;
+-            }
+-        }
+-        if (!found) {
+-            pools.push_back({shape.type, shape.expert_size, shape.pool_bytes,
+-                    shape.tensor_bytes, shape.scratch_bytes});
+-        }
+-    }
+-
+-    size_t scratch_bytes = 0;
+-    size_t supported_bytes = 0;
+-    for (const common_moe_cache_fit_pool & pool : pools) {
+-        if (pool.tensor_bytes < pool.pool_bytes) {
+-            continue;
+-        }
+-        supported_bytes += pool.tensor_bytes;
+-        scratch_bytes = std::max(scratch_bytes, pool.scratch_bytes);
+-    }
+-    if (supported_bytes == 0) {
+-        result.reason = "no routed expert shape is cacheable";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-    if (supported_bytes != result.expert_bytes) {
+-        result.reason = "some routed expert weights would remain permanently uncached";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-
+-    size_t minimum_pool_bytes = 0;
+-    for (const common_moe_cache_fit_pool & pool : pools) {
+-        if (pool.tensor_bytes < pool.pool_bytes) {
+-            continue;
+-        }
+-        if (pool.pool_bytes > SIZE_MAX - minimum_pool_bytes) {
+-            result.reason = "the minimum cache pool inventory overflowed";
+-            return result;
+-        }
+-        minimum_pool_bytes += pool.pool_bytes;
+-    }
+-    minimum_pool_bytes = std::max(minimum_pool_bytes, minimum_slab_bytes);
+-    if (minimum_pool_bytes > SIZE_MAX - scratch_bytes) {
+-        result.reason = "the minimum cache pool inventory overflowed";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-    result.minimum_device_bytes = scratch_bytes + minimum_pool_bytes;
+-
+-    int useful_devices = 0;
+-    for (const common_moe_cache_fit_device & device : result.devices) {
+-        if (device.cache_bytes < result.minimum_device_bytes) {
+-            continue;
+-        }
+-        useful_devices++;
+-        if (device.cache_bytes > SIZE_MAX - result.cache_bytes) {
+-            result.cache_bytes = SIZE_MAX;
+-        } else {
+-            result.cache_bytes += device.cache_bytes;
+-        }
+-    }
+-    if (useful_devices < min_devices) {
+-        result.reason = "too few devices can hold the minimum expert pools";
+-        LOG_INF("%s: MoE cache fit: %s (useful=%d, min=%d, min_device_bytes=%zu MiB)\n", __func__,
+-                result.reason.c_str(), useful_devices, min_devices,
+-                result.minimum_device_bytes >> 20);
+-        return result;
+-    }
+-
+-    result.feasible = true;
+-    result.reason = "cache pools are feasible";
+-    return result;
+-}
+-
+-static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
+-        const common_moe_cache_params * params,
+-        const std::vector<llama_moe_tensor_info> & tensors,
+-        const std::vector<ggml_backend_dev_t> & devices,
+-        const std::vector<llama_device_memory_data> & memory,
+-        const std::vector<int64_t> & margins) {
+-    common_moe_cache_fit_result result;
+-    if (!params || params->mode == COMMON_MOE_CACHE_MODE_OFF) {
+-        result.reason = "disabled";
+-        return result;
+-    }
+-    // Probe the provider that owns the fitted devices; fall back to the
+-    // thread's active provider (first registered) when no device is given.
+-    ggml_moe_cache_api api = ggml_moe_cache_active();
+-    if (!devices.empty()) {
+-        const ggml_moe_cache_api owned =
+-            ggml_moe_cache_get(ggml_backend_dev_backend_reg(devices[0]));
+-        if (owned.owner) {
+-            api = owned;
+-        }
+-    }
+-    if (!api.query_config || !api.query_device || !api.query_shape) {
+-        result.reason = "no cache provider is loaded";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-
+-    int automatic = -1;
+-    if (params->mode_explicit) {
+-        automatic = params->mode == COMMON_MOE_CACHE_MODE_AUTO ? 1 : 0;
+-    }
+-    ggml_moe_cache_config config = {};
+-    if (!api.query_config(automatic, params->budget_mib, &config)) {
+-        result.reason = "the cache provider is disabled";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-    if (tensors.empty()) {
+-        result.reason = "the model has no routed expert weight tensors";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-    if (memory.size() != devices.size() + 1 || margins.size() != devices.size()) {
+-        result.reason = "the fitted device inventory changed";
+-        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-        return result;
+-    }
+-
+-    std::vector<common_moe_cache_fit_device_input> device_inputs;
+-    size_t min_expert_bytes = 0;
+-    for (size_t index = 0; index < devices.size(); index++) {
+-        ggml_moe_cache_device_caps caps = {};
+-        if (!api.query_device(devices[index], &config, &caps)) {
+-            continue;
+-        }
+-        if (margins[index] < 0 || memory[index].free < margins[index]) {
+-            result.reason = "the fitted device margin exceeds free memory";
+-            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-            return result;
+-        }
+-        device_inputs.push_back({caps.physical_device, caps.compute_capability,
+-                memory[index].free - margins[index], memory[index].mb.total()});
+-        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+-    }
+-
+-    std::vector<common_moe_cache_fit_shape_input> shape_inputs;
+-    shape_inputs.reserve(tensors.size());
+-    for (const llama_moe_tensor_info & tensor : tensors) {
+-        if (tensor.n_expert <= 0 || tensor.expert_size == 0 ||
+-            (uint64_t)tensor.n_expert > SIZE_MAX / tensor.expert_size) {
+-            result.reason = "the model has an invalid routed expert tensor size";
+-            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+-            return result;
+-        }
+-        const size_t tensor_bytes = (size_t)tensor.n_expert * tensor.expert_size;
+-        ggml_moe_cache_shape_caps caps = {};
+-        const bool cacheable = tensor.expert_size >= min_expert_bytes &&
+-            api.query_shape(tensor.type, tensor.n_input, tensor.n_output,
+-                    tensor.n_expert, tensor.expert_size, &caps);
+-        shape_inputs.push_back({tensor.type, tensor.expert_size, tensor_bytes,
+-                caps.scratch_bytes, caps.pool_bytes, cacheable});
+-    }
+-
+-    return common_moe_cache_plan_fit(
+-            device_inputs, shape_inputs, config.reserve_bytes, config.budget_bytes,
+-            config.min_devices, config.minimum_slab_bytes);
+-}
+-
+-struct common_fit_logger_guard {
+-    ggml_log_callback original_callback;
+-    void * original_user_data;
+-    ggml_log_level min_level;
+-
+-    explicit common_fit_logger_guard(ggml_log_level min_level) : min_level(min_level) {
+-        llama_log_get(&original_callback, &original_user_data);
+-        llama_log_set(callback, this);
+-    }
+-
+-    ~common_fit_logger_guard() {
+-        llama_log_set(original_callback, original_user_data);
+-    }
+-
+-    static void callback(ggml_log_level level, const char * text, void * user_data) {
+-        const common_fit_logger_guard * guard = (const common_fit_logger_guard *) user_data;
+-        const ggml_log_level level_eff = level >= guard->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+-        guard->original_callback(level_eff, text, guard->original_user_data);
+-    }
+-};
 +#include "fit-moe.inc"
-+
+ 
  static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
          const char * path_model,
-         const llama_model_params * mparams,
-@@ -35,7 +43,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
-         uint32_t & hp_ngl,
+@@ -308,33 +44,50 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
          uint32_t & hp_n_ctx_train,
          uint32_t & hp_n_expert,
--        ggml_log_level log_level) {
-+        ggml_log_level log_level,
+         ggml_log_level log_level,
+-        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
+-        llama_context * ctx_parent = nullptr) {
+-    common_fit_logger_guard logger_guard(log_level);
 +        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr) {
-     struct user_data_t {
-         struct {
-             ggml_log_callback callback;
-@@ -63,6 +72,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
++    struct user_data_t {
++        struct {
++            ggml_log_callback callback;
++            void * user_data;
++        } original_logger;
++        ggml_log_level min_level; // prints below this log level go to debug log
++    };
++    user_data_t ud;
++    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
++    ud.min_level = log_level;
++
++    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
++        const user_data_t * ud = (const user_data_t *) user_data;
++        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
++        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
++    }, &ud);
+ 
+     llama_model_params mparams_copy = *mparams;
+     mparams_copy.no_alloc  = true;
+     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+ 
+-    llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
++    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+     if (model == nullptr) {
++        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
          throw std::runtime_error("failed to load model");
      }
  
+-    llama_context_params cparams_copy = *cparams;
+-    if (ctx_parent != nullptr) {
+-        cparams_copy.ctx_other = ctx_parent;
 +    if (moe_tensors) {
 +        moe_tensors->resize(llama_model_get_moe_tensor_info(model, nullptr, 0));
 +        llama_model_get_moe_tensor_info(model, moe_tensors->data(), moe_tensors->size());
-+    }
-+
-     llama_context * ctx = llama_init_from_model(model, *cparams);
+     }
+ 
+-    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams_copy));
++    llama_context * ctx = llama_init_from_model(model, *cparams);
      if (ctx == nullptr) {
-         llama_model_free(model);
-@@ -176,10 +190,44 @@ common_device_memory_data_vec common_get_device_memory_data(
++        llama_model_free(model);
++        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+         throw std::runtime_error("failed to create llama_context from model");
+     }
+ 
+-    const size_t nd = llama_model_n_devices(model.get());
++    const size_t nd = llama_model_n_devices(model);
+     std::vector<llama_device_memory_data> ret(nd + 1);
+ 
+-    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx.get());
++    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+ 
+     for (const auto & [buft, mb] : memory_breakdown) {
+         if (ggml_backend_buft_is_host(buft)) {
+@@ -349,7 +102,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+             continue;
+         }
+         for (size_t i = 0; i < nd; i++) {
+-            if (dev == llama_model_get_device(model.get(), i)) {
++            if (dev == llama_model_get_device(model, i)) {
+                 ret[i].mb.model   += mb.model;
+                 ret[i].mb.context += mb.context;
+                 ret[i].mb.compute += mb.compute;
+@@ -370,7 +123,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         ret.back().total = total;
+     }
+     for (size_t i = 0; i < nd; i++) {
+-        ggml_backend_dev_t dev = llama_model_get_device(model.get(), i);
++        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+ 
+         size_t free;
+         size_t total;
+@@ -394,25 +147,22 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+     }
+ 
+     devs.clear();
+-    for (int i = 0; i < llama_model_n_devices(model.get()); i++) {
+-        devs.push_back(llama_model_get_device(model.get(), i));
++    for (int i = 0; i < llama_model_n_devices(model); i++) {
++        devs.push_back(llama_model_get_device(model, i));
+     }
+ 
+-    hp_ngl         = llama_model_n_layer(model.get());
++    hp_ngl         = llama_model_n_layer(model);
+     if (mparams->load_mtp) {
+-        hp_ngl    += llama_model_n_layer_nextn(model.get());
++        hp_ngl    += llama_model_n_layer_nextn(model);
+     }
+-    hp_n_ctx_train = llama_model_n_ctx_train(model.get());
+-    hp_n_expert    = llama_model_n_expert(model.get());
++    hp_n_ctx_train = llama_model_n_ctx_train(model);
++    hp_n_expert    = llama_model_n_expert(model);
+ 
+-    if (moe_tensors) {
+-        const size_t count = llama_model_get_moe_tensor_info(model.get(), nullptr, 0);
+-        moe_tensors->resize(count);
+-        const size_t written = llama_model_get_moe_tensor_info(model.get(), moe_tensors->data(), moe_tensors->size());
+-        GGML_ASSERT(written == count);
+-    }
++    common_memory_breakdown_print(ctx);
+ 
+-    common_memory_breakdown_print(ctx.get());
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+ 
      return ret;
  }
- 
-+common_device_memory_data_vec common_get_device_memory_data_with_parent(
-+        const char * path_model,
-+        const llama_model_params * mparams,
-+        const llama_context_params * cparams,
-+        const char * path_parent,
-+        const llama_model_params * mparams_parent,
-+        const llama_context_params * cparams_parent,
-+        std::vector<ggml_backend_dev_t> & devs,
-+        uint32_t & hp_ngl,
-+        uint32_t & hp_n_ctx_train,
-+        uint32_t & hp_n_expert,
-+        ggml_log_level log_level) {
+@@ -452,41 +202,32 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+         ggml_log_level log_level) {
+-    common_fit_logger_guard logger_guard(log_level);
+-
+-    llama_model_params mparams_parent_copy = *mparams_parent;
+-    mparams_parent_copy.no_alloc  = true;
+-    mparams_parent_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+-
+-    llama_model_ptr model_parent(llama_model_load_from_file(path_parent, mparams_parent_copy));
+-    if (model_parent == nullptr) {
 +    llama_model_params parent = *mparams_parent;
 +    parent.no_alloc  = true;
 +    parent.load_mode = LLAMA_LOAD_MODE_NONE;
 +    llama_model * model_parent = llama_model_load_from_file(path_parent, parent);
 +    if (!model_parent) {
-+        throw std::runtime_error("failed to load parent model");
-+    }
+         throw std::runtime_error("failed to load parent model");
+     }
+-
+-    llama_context_ptr ctx_parent(llama_init_from_model(model_parent.get(), *cparams_parent));
+-    if (ctx_parent == nullptr) {
 +    llama_context * ctx_parent = llama_init_from_model(model_parent, *cparams_parent);
 +    if (!ctx_parent) {
 +        llama_model_free(model_parent);
-+        throw std::runtime_error("failed to create parent llama_context");
-+    }
+         throw std::runtime_error("failed to create parent llama_context");
+     }
+-
+-    std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
+-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+-            log_level, nullptr, ctx_parent.get());
+-
+-    common_device_memory_data_vec ret(impl.size());
+-    for (size_t i = 0; i < impl.size(); i++) {
+-        ret[i].total   = impl[i].total;
+-        ret[i].free    = impl[i].free;
+-        ret[i].model   = impl[i].mb.model;
+-        ret[i].context = impl[i].mb.context;
+-        ret[i].compute = impl[i].mb.compute;
+-    }
+-    return ret;
 +    // The current memory probe does not accept a parent context. Keep the parent
 +    // alive while measuring so backend allocation and device placement match it.
 +    const auto result = common_get_device_memory_data(path_model, mparams, cparams, devs,
@@ -133,37 +2559,147 @@ index faa595f84..d5175bc43 100644
 +    llama_free(ctx_parent);
 +    llama_model_free(model_parent);
 +    return result;
-+}
-+
+ }
+ 
  static void common_params_fit_impl(
          const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
          float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
--        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+-        common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
 +        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra,
 +        common_moe_cache_params * moe_cache, enum ggml_log_level log_level) {
      if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
          throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
      }
-@@ -261,7 +309,9 @@ static void common_params_fit_impl(
+@@ -498,11 +239,6 @@ static void common_params_fit_impl(
+     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+     uint32_t hp_nct = 0; // hparams.n_ctx_train
+     uint32_t hp_nex = 0; // hparams.n_expert
+-    std::vector<llama_moe_tensor_info> moe_tensors;
+-
+-    if (moe_cache) {
+-        moe_cache->fit_selected = false;
+-    }
+ 
+     // size the context for all sequences, but keep minimums and alignment per KV stream
+     const uint32_t n_seq_max  = std::max<uint32_t>(1, cparams->n_seq_max);
+@@ -573,18 +309,26 @@ static void common_params_fit_impl(
      // step 1: get data for default parameters and check whether any changes are necessary in the first place
  
      LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
--    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+-    const dmds_t dmds_full = common_get_device_memory_data_impl(
+-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
+-            log_level, &moe_tensors);
+-    const size_t nd = devs.size(); // number of devices
 +    std::vector<llama_moe_tensor_info> moe_tensors;
 +    dmds_t dmds_full = common_get_device_memory_data_impl(
 +            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &moe_tensors);
++
++    // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
++    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
++    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
  
-     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
-@@ -614,6 +664,7 @@ static void common_params_fit_impl(
+-    auto log_stock_fit = [&] {
+-        if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF &&
+-            !moe_tensors.empty() &&
+-            (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern)) {
+-            LOG_INF("%s: MoE cache fit kept stock placement because the complete model already meets the fit targets\n", __func__);
++    // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
++    if (n_ctx_auto) {
++        cparams->n_ctx = n_ctx_max;
++        if (n_seq_max > 1) {
++            LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
++                __func__, n_ctx_max, n_seq_max);
++            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+         }
+-    };
++    }
++    add_extra_memory(dmds_full);
++
++    const size_t nd = devs.size(); // number of devices
+ 
+     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
+     margins.reserve(nd);
+@@ -659,7 +403,6 @@ static void common_params_fit_impl(
+             if (projected_free_per_device[0] >= margins[0]) {
+                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
+                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+-                log_stock_fit();
+                 return;
+             }
+         } else {
+@@ -672,7 +415,6 @@ static void common_params_fit_impl(
+             }
+             if (!changes_needed) {
+                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+-                log_stock_fit();
+                 return;
+             }
+         }
+@@ -921,68 +663,17 @@ static void common_params_fit_impl(
+         return ret;
      };
  
+-    auto set_cache_layer_split = [&](const std::vector<uint32_t> & layers,
+-            llama_model_params & candidate, float * split,
+-            llama_model_tensor_buft_override * overrides) {
+-        GGML_ASSERT(layers.size() == nd);
+-        std::fill(split, split + llama_max_devices(), 0.0f);
+-        candidate.n_gpu_layers = 0;
+-        for (size_t id = 0; id < nd; id++) {
+-            if ((uint64_t)candidate.n_gpu_layers + layers[id] > INT32_MAX) {
+-                throw std::runtime_error("cache candidate layer count overflowed");
+-            }
+-            candidate.n_gpu_layers += layers[id];
+-            if (nd > 1) {
+-                split[id] = layers[id];
+-            }
+-        }
+-        candidate.tensor_split = split;
+-        overrides[0] = {common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type()};
+-        overrides[1] = {nullptr, nullptr};
+-        candidate.tensor_buft_overrides = overrides;
+-        candidate.use_extra_bufts = false;
+-    };
+-
+-    auto get_cache_candidate_memory = [&](const std::vector<uint32_t> & layers,
+-            dmds_t & candidate_memory) {
+-        std::vector<float> candidate_split(llama_max_devices(), 0.0f);
+-        std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
+-        llama_model_params candidate = *mparams;
+-        set_cache_layer_split(layers, candidate, candidate_split.data(), candidate_overrides.data());
+-
+-        std::vector<ggml_backend_dev_t> candidate_devs;
+-        uint32_t candidate_ngl = 0;
+-        uint32_t candidate_nct = 0;
+-        uint32_t candidate_nex = 0;
+-        candidate_memory = common_get_device_memory_data_impl(
+-                path_model, &candidate, cparams, candidate_devs,
+-                candidate_ngl, candidate_nct, candidate_nex, log_level);
+-        if (candidate_devs != devs || candidate_memory.size() != nd + 1) {
+-            return false;
+-        }
+-        for (size_t id = 0; id < nd; id++) {
+-            if (candidate_memory[id].mb.total() > INT64_MAX ||
+-                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    };
+-
+-    std::vector<uint32_t> cache_layers;
+-    dmds_t cache_memory;
+-    bool cache_candidate_valid = false;
+-    bool cache_candidate_main = false;
+-
      int64_t global_surplus_cpu_moe = 0;
 +    dmds_t dmds_cpu_moe;
      if (hp_nex > 0) {
-         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
++        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
          ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-@@ -622,7 +673,7 @@ static void common_params_fit_impl(
+-        tensor_buft_overrides[0] = {common_moe_cache_tensor_override_pattern(), cpu_buft};
++        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
+         tensor_buft_overrides[1] = {nullptr, nullptr};
          mparams->tensor_buft_overrides = tensor_buft_overrides;
  
          LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
@@ -172,10 +2708,36 @@ index faa595f84..d5175bc43 100644
              path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
          add_extra_memory(dmds_cpu_moe);
  
-@@ -727,8 +778,26 @@ static void common_params_fit_impl(
+@@ -1087,37 +778,26 @@ static void common_params_fit_impl(
              "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
              __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
      }
+-
+-    if (hp_nex > 0 && global_surplus_cpu_moe > 0 && moe_cache &&
+-        moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && !moe_tensors.empty()) {
+-        std::vector<uint32_t> dense_layers(nd, 0);
+-        uint64_t assigned_layers = 0;
+-        for (size_t id = 0; id < nd; id++) {
+-            dense_layers[id] = ngl_per_device[id].n_layer;
+-            assigned_layers += dense_layers[id];
+-        }
+-
+-        const uint64_t required_layers = (uint64_t)hp_ngl + 1;
+-        if (assigned_layers == required_layers) {
+-            const int main_gpu = mparams->main_gpu;
+-            if (main_gpu >= 0 && main_gpu < (int)nd && required_layers <= UINT32_MAX) {
+-                std::vector<uint32_t> main_layers(nd, 0);
+-                main_layers[main_gpu] = (uint32_t)required_layers;
+-                if (get_cache_candidate_memory(main_layers, cache_memory)) {
+-                    cache_layers = std::move(main_layers);
+-                    cache_candidate_valid = true;
+-                    cache_candidate_main = true;
+-                }
+-            }
+-            if (!cache_candidate_valid && get_cache_candidate_memory(dense_layers, cache_memory)) {
+-                cache_layers = std::move(dense_layers);
+-                cache_candidate_valid = true;
+-            }
 +    auto set_moe_cache_placement = [&]() {
 +        if (!moe_cache || hp_nex == 0 || dmds_cpu_moe.empty()) return;
 +        const common_moe_cache_fit_result fit = common_moe_cache_evaluate_fit(
@@ -183,7 +2745,8 @@ index faa595f84..d5175bc43 100644
 +        if (!fit.feasible) {
 +            LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, fit.reason.c_str());
 +            return;
-+        }
+         }
+-    }
 +        const size_t ntbo = llama_max_tensor_buft_overrides();
 +        for (size_t i = ntbo - 1; i > 0; --i) tensor_buft_overrides[i] = tensor_buft_overrides[i - 1];
 +        tensor_buft_overrides[0] = { common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type() };
@@ -192,31 +2755,250 @@ index faa595f84..d5175bc43 100644
 +        LOG_INF("%s: MoE cache fit selected %zu MiB cache capacity for %zu MiB of routed experts\n",
 +                __func__, fit.cache_bytes >> 20, fit.expert_bytes >> 20);
 +    };
-+
+ 
      if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
          set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 +        set_moe_cache_placement();
          return;
      }
  
-@@ -874,6 +943,7 @@ static void common_params_fit_impl(
+@@ -1262,217 +942,8 @@ static void common_params_fit_impl(
+             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
      }
  
+-    bool stock_spills_experts = false;
+-    for (const ngl_t & layers : ngl_per_device) {
+-        if (layers.n_part > 0) {
+-            stock_spills_experts = true;
+-            break;
+-        }
+-    }
+-
+-    if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF) {
+-        if (!stock_spills_experts) {
+-            LOG_INF("%s: MoE cache fit kept stock placement because all routed expert weights fit in VRAM\n", __func__);
+-        } else if (moe_cache->mode == COMMON_MOE_CACHE_MODE_SOFT) {
+-            // Step 1: try spare-VRAM (stock placement, no expert eviction)
+-            common_moe_cache_fit_result soft_fit = common_moe_cache_evaluate_fit(
+-                    moe_cache, moe_tensors, devs, dmds_full, margins);
+-            if (soft_fit.feasible) {
+-                moe_cache->fit_selected = true;
+-
+-                const double coverage = soft_fit.expert_bytes > 0
+-                    ? 100.0 * (double)std::min(soft_fit.cache_bytes, soft_fit.expert_bytes) /
+-                        (double)soft_fit.expert_bytes
+-                    : 0.0;
+-                LOG_INF("%s: MoE cache soft mode selected stock placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage, no expert eviction)\n",
+-                        __func__,
+-                        (int64_t)(soft_fit.cache_bytes / MiB), (int64_t)(soft_fit.expert_bytes / MiB), coverage);
+-                for (const common_moe_cache_fit_device & device : soft_fit.devices) {
+-                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+-                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+-                            (int64_t)(soft_fit.minimum_device_bytes / MiB));
+-                }
+-            } else if (cache_candidate_valid) {
+-                // Step 2: spare-VRAM insufficient, try partial expert eviction
+-                // Binary search for minimum evicted layers where cache pools fit
+-                LOG_INF("%s: MoE cache soft mode: spare-VRAM insufficient (%s), searching for minimum expert eviction\n",
+-                        __func__, soft_fit.reason.c_str());
+-
+-                const int total_layers = (int)(hp_ngl + 1);
+-                static std::vector<std::string> pattern_strings;
+-                pattern_strings.clear();
+-                pattern_strings.reserve(total_layers);
+-
+-                // Per-layer routed-expert bytes from tensor metadata. Evicting
+-                // layers in ascending footprint order makes the search minimize
+-                // the bytes evicted, not just the number of prefix layers.
+-                std::vector<int64_t> layer_bytes(total_layers, 0);
+-                for (const llama_moe_tensor_info & tensor : moe_tensors) {
+-                    if (tensor.layer >= 0 && tensor.layer < total_layers &&
+-                        tensor.n_expert > 0 && tensor.expert_size > 0 &&
+-                        (uint64_t)tensor.n_expert <= (uint64_t)(INT64_MAX / (int64_t)tensor.expert_size)) {
+-                        layer_bytes[tensor.layer] +=
+-                            (int64_t)tensor.n_expert * (int64_t)tensor.expert_size;
+-                    }
+-                }
+-                std::vector<int> order(total_layers);
+-                for (int i = 0; i < total_layers; i++) {
+-                    order[i] = i;
+-                }
+-                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+-                    return layer_bytes[a] != layer_bytes[b]
+-                        ? layer_bytes[a] < layer_bytes[b] : a < b;
+-                });
+-
+-                int lo = 0, hi = total_layers;
+-                int best_n_evict = -1;
+-                int64_t best_evicted_bytes = 0;
+-                dmds_t best_memory;
+-                common_moe_cache_fit_result best_cache_fit;
+-
+-                while (lo <= hi) {
+-                    const int mid = lo + (hi - lo) / 2;
+-
+-                    // Build candidate: all layers on main GPU, the 'mid'
+-                    // smallest-footprint layers' experts moved to CPU
+-                    std::vector<float> candidate_split(llama_max_devices(), 0.0f);
+-                    std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
+-                    llama_model_params candidate = *mparams;
+-
+-                    candidate.n_gpu_layers = 0;
+-                    for (size_t id = 0; id < nd; id++) {
+-                        if ((uint64_t)candidate.n_gpu_layers + cache_layers[id] > INT32_MAX) break;
+-                        candidate.n_gpu_layers += cache_layers[id];
+-                        if (nd > 1) candidate_split[id] = (float)cache_layers[id];
+-                    }
+-                    candidate.tensor_split = candidate_split.data();
+-
+-                    // Per-layer overrides: evict the chosen layers' experts to CPU
+-                    pattern_strings.clear();
+-                    int n_overrides = 0;
+-                    for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
+-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+-                        candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+-                    }
+-                    candidate_overrides[n_overrides] = {nullptr, nullptr};
+-                    candidate.tensor_buft_overrides = candidate_overrides.data();
+-                    candidate.use_extra_bufts = false;
+-
+-                    // Evaluate memory and cache for this candidate
+-                    std::vector<ggml_backend_dev_t> candidate_devs;
+-                    uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
+-                    dmds_t candidate_memory = common_get_device_memory_data_impl(
+-                            path_model, &candidate, cparams, candidate_devs,
+-                            c_ngl, c_nct, c_nex, log_level);
+-
+-                    bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
+-                    if (candidate_valid) {
+-                        for (size_t id = 0; id < nd; id++) {
+-                            if (candidate_memory[id].mb.total() > INT64_MAX ||
+-                                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+-                                candidate_valid = false;
+-                                break;
+-                            }
+-                        }
+-                    }
+-
+-                    if (candidate_valid) {
+-                        common_moe_cache_fit_result cf = common_moe_cache_evaluate_fit(
+-                                moe_cache, moe_tensors, devs, candidate_memory, margins);
+-                        if (cf.feasible) {
+-                            best_n_evict = mid;
+-                            best_evicted_bytes = 0;
+-                            for (int i = 0; i < mid; i++) {
+-                                best_evicted_bytes += layer_bytes[order[i]];
+-                            }
+-                            best_memory = std::move(candidate_memory);
+-                            best_cache_fit = cf;
+-                            hi = mid - 1;  // Try fewer evictions
+-                        } else {
+-                            lo = mid + 1;  // Need more evictions
+-                        }
+-                    } else {
+-                        lo = mid + 1;
+-                    }
+-                }
+-
+-                if (best_n_evict >= 0) {
+-                    // Apply the best placement with minimal expert eviction
+-                    std::fill(tensor_split, tensor_split + llama_max_devices(), 0.0f);
+-                    mparams->n_gpu_layers = 0;
+-                    for (size_t id = 0; id < nd; id++) {
+-                        mparams->n_gpu_layers += cache_layers[id];
+-                        if (nd > 1) tensor_split[id] = (float)cache_layers[id];
+-                    }
+-                    mparams->tensor_split = tensor_split;
+-
+-                    // Generate final per-layer overrides
+-                    pattern_strings.clear();
+-                    int n_overrides = 0;
+-                    for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
+-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+-                        tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+-                    }
+-                    tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
+-                    mparams->tensor_buft_overrides = tensor_buft_overrides;
+-                    mparams->use_extra_bufts = false;
+-                    moe_cache->fit_selected = true;
+-
+-                    const int n_kept = total_layers - best_n_evict;
+-                    const double coverage = best_cache_fit.expert_bytes > 0
+-                        ? 100.0 * (double)std::min(best_cache_fit.cache_bytes, best_cache_fit.expert_bytes) /
+-                            (double)best_cache_fit.expert_bytes
+-                        : 0.0;
+-                    const int64_t kept_bytes = best_cache_fit.expert_bytes > (size_t)best_evicted_bytes
+-                        ? (int64_t)best_cache_fit.expert_bytes - best_evicted_bytes : 0;
+-                    LOG_INF("%s: MoE cache soft mode selected partial-eviction placement: %d/%d layers keep experts GPU-resident, "
+-                            "%" PRId64 " MiB of %" PRId64 " MiB routed expert bytes evicted (%" PRId64 " MiB kept), "
+-                            "%" PRId64 " MiB projected cache capacity (up to %.1f%% coverage)\n",
+-                            __func__, n_kept, total_layers,
+-                            (int64_t)(best_evicted_bytes / MiB), (int64_t)(best_cache_fit.expert_bytes / MiB),
+-                            (int64_t)(kept_bytes / MiB),
+-                            (int64_t)(best_cache_fit.cache_bytes / MiB), coverage);
+-                    for (const common_moe_cache_fit_device & device : best_cache_fit.devices) {
+-                        LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+-                                __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+-                                (int64_t)(best_cache_fit.minimum_device_bytes / MiB));
+-                    }
+-                    return;
+-                }
+-                LOG_INF("%s: MoE cache soft mode kept stock placement (partial eviction could not fit cache pools)\n",
+-                        __func__);
+-            } else {
+-                LOG_INF("%s: MoE cache soft mode kept stock placement (spare-VRAM insufficient): %s\n",
+-                        __func__, soft_fit.reason.c_str());
+-            }
+-        } else if (!cache_candidate_valid) {
+-            LOG_INF("%s: MoE cache fit kept stock placement because canonical dense weights do not meet the fit targets\n", __func__);
+-        } else {
+-            common_moe_cache_fit_result cache_fit = common_moe_cache_evaluate_fit(
+-                    moe_cache, moe_tensors, devs, cache_memory, margins);
+-            if (cache_fit.feasible) {
+-                set_cache_layer_split(cache_layers, *mparams, tensor_split, tensor_buft_overrides);
+-                moe_cache->fit_selected = true;
+-
+-                const double coverage = cache_fit.expert_bytes > 0
+-                    ? 100.0 * (double)std::min(cache_fit.cache_bytes, cache_fit.expert_bytes) /
+-                        (double)cache_fit.expert_bytes
+-                    : 0.0;
+-                LOG_INF("%s: MoE cache fit selected %s dense placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage)\n",
+-                        __func__, cache_candidate_main ? "main-device" : "packed",
+-                        (int64_t)(cache_fit.cache_bytes / MiB), (int64_t)(cache_fit.expert_bytes / MiB), coverage);
+-                for (const common_moe_cache_fit_device & device : cache_fit.devices) {
+-                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+-                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+-                            (int64_t)(cache_fit.minimum_device_bytes / MiB));
+-                }
+-                return;
+-            }
+-            LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, cache_fit.reason.c_str());
+-        }
+-    }
+-
      set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 +    set_moe_cache_placement();
  }
  
  enum common_params_fit_status common_fit_params(
-@@ -889,7 +959,7 @@ enum common_params_fit_status common_fit_params(
+@@ -1481,7 +952,6 @@ enum common_params_fit_status common_fit_params(
+         llama_context_params * cparams,
+         float * tensor_split,
+         llama_model_tensor_buft_override * tensor_buft_overrides,
+-        common_moe_cache_params * moe_cache,
+         size_t * margins,
+         uint32_t n_ctx_min,
+         const common_fit_extra_model * extra,
+@@ -1489,7 +959,7 @@ enum common_params_fit_status common_fit_params(
      const int64_t t0_us = llama_time_us();
      common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
      try {
--        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, log_level);
 +        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, nullptr, log_level);
          LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
      } catch (const common_params_fit_exception & e) {
          LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
-@@ -903,6 +973,32 @@ enum common_params_fit_status common_fit_params(
+@@ -1503,6 +973,32 @@ enum common_params_fit_status common_fit_params(
      return status;
  }
  
@@ -250,25 +3032,74 @@ index faa595f84..d5175bc43 100644
      //const auto & devices = ctx->get_model().devices;
      const auto * model = llama_get_model(ctx);
 diff --git a/common/fit.h b/common/fit.h
-index 824d386b0..b5d2ff328 100644
+index b5e83f1c6..b5d2ff328 100644
 --- a/common/fit.h
 +++ b/common/fit.h
-@@ -3,8 +3,14 @@
+@@ -3,55 +3,14 @@
  #include "ggml.h"
  #include "llama.h"
  
+-#include <cstdint>
+-#include <string>
 +#include "fit-moe-public.h"
 +
  #include <vector>
  
-+struct common_moe_cache_params;
-+
-+const char * common_moe_cache_tensor_override_pattern();
-+
+ struct common_moe_cache_params;
+ 
+ const char * common_moe_cache_tensor_override_pattern();
+ 
+-struct common_moe_cache_fit_device_input {
+-    int physical_device = -1;
+-    int compute_capability = 0;
+-    int64_t free_bytes = 0;
+-    size_t used_bytes = 0;
+-};
+-
+-struct common_moe_cache_fit_shape_input {
+-    enum ggml_type type = GGML_TYPE_COUNT;
+-    size_t expert_size = 0;
+-    size_t tensor_bytes = 0;
+-    size_t scratch_bytes = 0;
+-    size_t pool_bytes = 0;
+-    bool cacheable = false;
+-};
+-
+-struct common_moe_cache_fit_device {
+-    int physical_device = -1;
+-    int compute_capability = 0;
+-    int64_t free_bytes = 0;
+-    int64_t used_bytes = 0;
+-    size_t cache_bytes = 0;
+-};
+-
+-struct common_moe_cache_fit_result {
+-    bool feasible = false;
+-    std::string reason;
+-    std::vector<common_moe_cache_fit_device> devices;
+-    size_t expert_bytes = 0;
+-    size_t cache_bytes = 0;
+-    size_t minimum_device_bytes = 0;
+-};
+-
+-common_moe_cache_fit_result common_moe_cache_plan_fit(
+-        const std::vector<common_moe_cache_fit_device_input> & devices,
+-        const std::vector<common_moe_cache_fit_shape_input> & shapes,
+-        size_t reserve_bytes,
+-        size_t budget_bytes,
+-        int min_devices,
+-        size_t minimum_slab_bytes = 0);
+-
  enum common_params_fit_status {
      COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
      COMMON_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
-@@ -37,6 +43,20 @@ common_params_fit_status common_fit_params(
+@@ -79,12 +38,25 @@ common_params_fit_status common_fit_params(
+                llama_context_params * cparams,
+                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
+    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
+-           common_moe_cache_params * moe_cache,
+                              size_t * margins,               // margins of memory to leave per device in bytes
+                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
        const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                       ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
  
@@ -289,264 +3120,169 @@ index 824d386b0..b5d2ff328 100644
  // print estimated memory to stdout
  void common_fit_print(
                           const char * path_model,
-@@ -65,3 +85,17 @@ common_device_memory_data_vec common_get_device_memory_data(
-                            uint32_t & hp_n_ctx_train,
+@@ -114,7 +86,7 @@ common_device_memory_data_vec common_get_device_memory_data(
                             uint32_t & hp_n_expert,
                       ggml_log_level   log_level);
-+
+ 
+-// Load a parent model + context with no_alloc, then return the per-device memory breakdown of a child model + context.
 +// Measure a child model with a no-alloc parent model/context already resident.
-+common_device_memory_data_vec common_get_device_memory_data_with_parent(
-+                         const char * path_model,
-+           const llama_model_params * mparams,
-+         const llama_context_params * cparams,
-+                         const char * path_parent,
-+           const llama_model_params * mparams_parent,
-+         const llama_context_params * cparams_parent,
-+    std::vector<ggml_backend_dev_t> & devs,
-+                           uint32_t & hp_ngl,
-+                           uint32_t & hp_n_ctx_train,
-+                           uint32_t & hp_n_expert,
-+                     ggml_log_level   log_level);
+ common_device_memory_data_vec common_get_device_memory_data_with_parent(
+                          const char * path_model,
+            const llama_model_params * mparams,
+diff --git a/common/jinja/caps.cpp b/common/jinja/caps.cpp
+index bd61f0020..c5962ab77 100644
+--- a/common/jinja/caps.cpp
++++ b/common/jinja/caps.cpp
+@@ -32,12 +32,6 @@ void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effor
+     ctx.set_val("reasoning_strength", var);
+ }
+ 
+-void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort) {
+-    value var = mk_val<value_string>(effort); // bind to the same value for stats
+-    ctx.set_val("reasoning_effort",   var);
+-    ctx.set_val("reasoning_strength", var);
+-}
+-
+ static void caps_try_execute(jinja::program & prog,
+                              const caps_json_fn & messages_fn,
+                              const caps_ctx_fn & ctx_fn,
+@@ -140,7 +134,7 @@ caps caps_get(jinja::program & prog) {
+         },
+         nullptr, // ctx_fn
+         nullptr, // tools_fn
+-        [&](context &, bool success, value & messages, value &, const std::string &) {
++        [&](context &, bool success, value & messages, value &, const std::string & rendered) {
+             auto & content = messages->at(0)->at("content");
+             caps_print_stats(content, "messages[0].content");
+             if (has_op(content, "test_is_string")) {
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 8d815b9a0..97faa5d62 100644
+index 9d1b1867a..724bdd8de 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2,6 +2,7 @@
+@@ -929,6 +929,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
+     int32_t n_embd_tgt = 0;  // target model hidden size
  
- #include "common.h"
- #include "ggml.h"
-+#include "ggml-cpp.h"
- #include "llama.h"
- #include "log.h"
- #include "ngram-cache.h"
-@@ -303,7 +304,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
-             drafting[seq_id] = true;
-             common_sampler_reset(smpls[seq_id].get());
++    // Scratch buffer for concatenated target features [n_tokens, n_embd_enc].
++    std::vector<float> features_buf;
++
+     int32_t     block_size    = 0;
+     llama_token mask_token_id = 0;
  
--            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
-         }
- 
-         int ret = llama_decode(ctx_dft, batch);
-@@ -362,7 +363,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
-                     continue;
+@@ -1258,7 +1261,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     batch_inject.seq_id[i][0] = seq_id;
+                     batch_inject.logits[i]    = false;
                  }
- 
--                common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-+                common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
+-                const int32_t rc = llama_decode(ctx_dft, batch_inject);
++                rc = llama_decode(ctx_dft, batch_inject);
+                 if (rc != 0) {
+                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                             __func__, rc, (int) n_chunk, (int) offset);
+@@ -1360,37 +1363,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 continue;
              }
  
-             if (batch.n_tokens == 0) {
-@@ -1245,13 +1246,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
- 
-             common_sampler_reset(smpls[seq_id].get());
- 
--            // dp.n_past is the slot's token count. For an M-RoPE target that is no longer the
-+            // dp.pos0 is the slot's token count. For an M-RoPE target that is no longer the
-             // next position once an image has been in the prompt (image tokens advance the
-             // position by the grid size, not by their count), and a noise block placed at the
-             // token count sits hundreds of positions past the draft's own cache. Take the next
-             // position from the target's memory instead; without images the two are equal.
-             const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
--            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.n_past;
-+            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.pos0;
- 
-             const int32_t n_draft = params.n_max;
- 
-@@ -1942,7 +1943,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
- 
-                 // deferred rows at or past n_past hold candidates the verify
-                 // rejected; the committed prefix ends at n_past - 1. Drop them.
--                drop_deferred_from(seq_one, dp.n_past);
-+                drop_deferred_from(seq_one, dp.pos0);
- 
-                 // rows of other sequences cannot join a single-sequence chain
-                 // batch; decode all remaining rows standalone in that case
-@@ -1968,7 +1969,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                 defer.embd.clear();
- 
-                 for (int j = 0; j < n_chain; ++j) {
--                    common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.n_past + j, { seq_one }, true);
-+                    common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.pos0 + j, { seq_one }, true);
-                     if (j == 0) {
-                         std::memcpy(batch.embd + (size_t) n_catchup * n_embd, pending_h[seq_one].data(), row_bytes);
-                     } else {
-@@ -2064,7 +2065,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-         if (any_drafting && !defer.tok.empty()) {
-             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                 if (dparams[seq_id].drafting) {
--                    drop_deferred_from(seq_id, dparams[seq_id].n_past);
-+                    drop_deferred_from(seq_id, dparams[seq_id].pos0);
-                 }
-             }
-         }
-@@ -2097,7 +2098,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                 n_cap[seq_id] = dp.n_max;
-             }
- 
--            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
-             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
- 
-             i_last[seq_id] = batch.n_tokens - 1;
-@@ -2120,7 +2121,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                 auto * mem_dft = llama_get_memory(ctx_dft);
-                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                     if (drafting[seq_id]) {
--                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].n_past, -1);
-+                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
-                     }
-                 }
-                 llama_set_nextn_layer_offset(ctx_dft, i);
-@@ -2186,19 +2187,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
-                     for (int t = 0; t < n_rows; ++t) {
-                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
--                        common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
-+                        common_batch_add(batch, tok, dp.pos0 + t, { seq_id }, t == n_rows - 1);
-                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
-                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
-                     }
-                 } else if (same_position_draft) {
-                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
-                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
--                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
-+                    common_batch_add(batch, id, dp.pos0, { seq_id }, true);
-                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
-                 } else {
-                     // is_mem_shared models with a real trained NextN head (qwen35, qwen4exp, ...)
-                     // still draft at incrementing positions, same as the non-shared-memory path
--                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-+                    common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
-                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
-                 }
- 
-@@ -2705,6 +2706,9 @@ struct common_speculative {
- 
-     // which implementaion was used for a given seq_id
-     std::vector<common_speculative_impl *> impl_last;
-+
-+    std::vector<double> synth_probs;
-+    int32_t n_max = 0;
- };
- 
- static common_ngram_map get_common_ngram_map(
-@@ -2803,6 +2807,25 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
-     return it->second;
- }
- 
-+std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
-+    gguf_init_params params = { true, nullptr };
-+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), params));
-+    if (!ctx) return {};
-+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
-+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) return {};
-+    const std::string arch = gguf_get_val_str(ctx.get(), arch_id);
-+    if (arch != "dflash") {
-+        const int64_t blocks_key = gguf_find_key(ctx.get(), (arch + ".block_count").c_str());
-+        if (blocks_key < 0) return {};
-+        const uint32_t blocks = gguf_get_val_u32(ctx.get(), blocks_key);
-+        return gguf_find_tensor(ctx.get(), ("blk." + std::to_string(blocks - 1) + ".nextn.eh_proj.weight").c_str()) >= 0
-+            ? std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
-+            : std::vector<common_speculative_type>{};
-+    }
-+    return { gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0
-+        ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-+}
-+
- static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
-     uint32_t result = 0;
-     for (size_t i = 0; i < configs.size(); i++) {
-@@ -2848,6 +2871,50 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
-     return n_max;
- }
- 
-+int32_t common_speculative_n_max(const common_speculative * spec) {
-+    return spec == nullptr ? 0 : spec->n_max;
-+}
-+
-+std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {
-+    const bool has_length = spec->synth_len != -1.0;
-+    const bool has_rates = !spec->synth_rates.empty();
-+    if (!has_length && !has_rates) return {};
-+    if (has_length && has_rates) throw std::invalid_argument("synthetic acceptance length and rates are mutually exclusive");
-+    if (n_max <= 0) throw std::invalid_argument("synthetic acceptance requires at least one speculative token");
-+    if (has_rates) {
-+        if (spec->synth_rates.size() != (size_t) n_max) throw std::invalid_argument("synthetic acceptance rates have an invalid length");
-+        for (size_t i = 0; i < spec->synth_rates.size(); ++i) {
-+            const double rate = spec->synth_rates[i];
-+            if (!std::isfinite(rate) || rate < 0.0 || rate > 1.0 || (i > 0 && rate > spec->synth_rates[i - 1])) {
-+                throw std::invalid_argument("synthetic acceptance rates must be finite, within [0, 1], and non-increasing");
-+            }
-+        }
-+        return spec->synth_rates;
-+    }
-+    const double length_max = (double) n_max + 1.0;
-+    if (!std::isfinite(spec->synth_len) || spec->synth_len < 1.0 || spec->synth_len > length_max) {
-+        throw std::invalid_argument("synthetic acceptance length is outside its valid range");
-+    }
-+    double p_min = 0.0;
-+    double p_max = spec->synth_len == length_max ? 1.0 : 1.0;
-+    for (int i = 0; i < 32 && spec->synth_len != length_max; ++i) {
-+        const double p = 0.5 * (p_min + p_max);
-+        double sum = 0.0;
-+        double term = p;
-+        for (int32_t j = 0; j < n_max; ++j) { sum += term; term *= p; }
-+        if (sum < spec->synth_len - 1.0) p_min = p; else p_max = p;
-+    }
-+    std::vector<double> rates;
-+    double rate = spec->synth_len == length_max ? 1.0 : 0.5 * (p_min + p_max);
-+    for (int32_t i = 0; i < n_max; ++i) { rates.push_back(rate); rate *= (spec->synth_len == length_max ? 1.0 : 0.5 * (p_min + p_max)); }
-+    return rates;
-+}
-+
-+const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
-+    GGML_ASSERT(spec);
-+    return spec->synth_probs;
-+}
-+
- common_params common_base_params_to_speculative(const common_params & params) {
-     const bool has_draft = params.speculative.has_dft();
- 
-@@ -3123,11 +3190,21 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+-            if (is_dspark) {
+-                // DSpark predicts the next token from position 0 and optionally truncates
+-                // at the first position below the confidence threshold.
+-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+-
+-                int32_t predecessor = 0;
+-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+-
+-                    predecessor = (int32_t) std::distance(scores,
+-                            std::max_element(scores, scores + selector_top_k));
+-                    if (params.p_min > 0.0f) {
+-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+-                        float sum = 0.0f;
+-                        for (int32_t k = 0; k < selector_top_k; ++k) {
+-                            sum += std::exp(scores[k] - scores[predecessor]);
+-                        }
+-                        if (1.0f / sum < params.p_min) {
+-                            break;
+-                        }
+-                    }
+-                    result.push_back((llama_token) row[predecessor]);
+-                }
+-
+-                if (result.size() < (size_t) params.n_min) {
+-                    result.clear();
+-                }
+-                continue;
+-            }
+-
+             if (is_dspark) {
+                 // DSpark: read from the first draft slot, truncate below the confidence threshold
+                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+@@ -1521,7 +1493,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      }
  
-     auto * result = new common_speculative {
--        /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
--        /* .impls     = */ std::move(impls),
--        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
-+        /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
-+        /* .impls       = */ std::move(impls),
-+        /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
-+        /* .synth_probs = */ {},
-+        /* .n_max       = */ common_speculative_n_max(&params),
-     };
- 
-+    const auto rates = common_speculative_synth_rates_resolve(&params, common_speculative_n_max(&params));
-+    result->synth_probs.reserve(rates.size());
-+    double rate_prev = 1.0;
-+    for (const double rate : rates) {
-+        result->synth_probs.push_back(rate_prev > 0.0 ? rate / rate_prev : 0.0);
-+        rate_prev = rate;
-+    }
-+
-     return result;
- }
- 
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false)
+-        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
++        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+     {
+         auto * ctx_tgt = this->params.ctx_tgt;
 diff --git a/common/speculative.h b/common/speculative.h
-index c968750e2..3b704fb74 100644
+index c968750e2..ce6bb1621 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -62,6 +62,9 @@ struct common_speculative_draft_params {
      int32_t n_max = -1;
  
      llama_pos   pos0;
-+    // Number of committed tokens in this sequence's draft cache.  Draft
++    // Number of committed tokens in this sequence's draft cache. Draft
 +    // implementations use it as the first position for their next batch.
 +    int32_t     n_past = 0;
      llama_token id_last;
  
      // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 3aca7f7c9..8a96a6066 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <algorithm>
+ #include <mutex>
++#include <unordered_map>
+ #include <vector>
+ 
+ // MoE expert cache providers, keyed by backend registration object. Multiple
+diff --git a/include/llama.h b/include/llama.h
+index 9335d7580..02f66b8ec 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -377,6 +377,7 @@ extern "C" {
+         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+         bool     gdn_replay;        // ingredient-replay rollback instead of full K-snapshots when n_rs_seq > 0 [EXPERIMENTAL]
+         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
++        uint32_t n_outputs_max_per_seq; // max outputs a backend sampler must retain for one sequence [EXPERIMENTAL]
+         int32_t  n_threads;         // number of threads to use for generation
+         int32_t  n_threads_batch;   // number of threads to use for batch processing
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c98dbe5a8..cb7288b0f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -109,6 +109,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
+ 
+     cparams.n_seq_max     = std::max(1u, params.n_seq_max);
+     cparams.n_outputs_max = params.n_outputs_max;
++    cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq;
+     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+     }
+@@ -4581,6 +4582,7 @@ llama_context_params llama_context_default_params() {
+         /*.n_rs_seq                    =*/0,
+         /*.gdn_replay                  =*/false,
+         /*.n_outputs_max               =*/0,
++        /*.n_outputs_max_per_seq       =*/1,
+         /*.n_threads                   =*/GGML_DEFAULT_N_THREADS,  // TODO: better default
+         /*.n_threads_batch             =*/GGML_DEFAULT_N_THREADS,
+         /*.ctx_type                    =*/LLAMA_CONTEXT_TYPE_DEFAULT,
 diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
 index 5bef7d529..add8a64d3 100644
 --- a/tools/llama-bench/llama-bench.cpp
@@ -747,25 +3483,130 @@ index 5bef7d529..add8a64d3 100644
          }
          if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
              fields.emplace_back("embeddings");
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index 6b705aa0f..72148a4d9 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -501,6 +501,8 @@ enum projector_type {
+     PROJECTOR_TYPE_MIMO_AUDIO,
+     PROJECTOR_TYPE_QWEN3TTS_SPKENC,
+     PROJECTOR_TYPE_QWEN3TTS_GEN,
++    PROJECTOR_TYPE_POCKETTTS_SPKENC,
++    PROJECTOR_TYPE_POCKETTTS_GEN,
+     PROJECTOR_TYPE_MUSE_GLIMMER,
+     PROJECTOR_TYPE_UNKNOWN,
+ };
+@@ -564,6 +566,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
+     { PROJECTOR_TYPE_QWEN3TTS_SPKENC,   "qwen3tts_spkenc"},
+     { PROJECTOR_TYPE_QWEN3TTS_GEN,      "qwen3tts_gen"},
++    { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
++    { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
+     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+ };
+ 
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 3b6525a5e..5945c6d92 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -439,8 +439,3 @@ struct clip_graph_muse_glimmer : clip_graph {
+     clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+     ggml_cgraph * build() override;
+ };
+-
+-struct clip_graph_muse_glimmer : clip_graph {
+-    clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+-    ggml_cgraph * build() override;
+-};
+diff --git a/tools/mtmd/mtmd-image.cpp b/tools/mtmd/mtmd-image.cpp
+index 8dd99eefa..c11d35c87 100644
+--- a/tools/mtmd/mtmd-image.cpp
++++ b/tools/mtmd/mtmd-image.cpp
+@@ -1735,65 +1735,3 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
+     output.append(hparams, resized_image, true);
+     return output;
+ }
+-
+-//
+-// mtmd_image_preprocessor_muse_glimmer
+-//
+-
+-// Replicates transformers' get_aspect_ratio_preserving_size
+-static clip_image_size muse_glimmer_grid_size(int img_w, int img_h, int patch_hw, int max_tokens) {
+-    double i_nph = (double) img_h / patch_hw;
+-    double i_npw = (double) img_w / patch_hw;
+-    const double ratio = i_nph > 0.0 ? i_npw / i_nph : 1.0;
+-    if (i_nph * i_npw > (double) max_tokens) {
+-        i_nph = std::sqrt((double) max_tokens / ratio);
+-        i_npw = i_nph * ratio;
+-    }
+-    const int hs[2] = { (int) std::floor(i_nph), (int) std::ceil(i_nph) };
+-    const int ws[2] = { (int) std::floor(i_npw), (int) std::ceil(i_npw) };
+-    const double target_ar = (double) img_h / (double) img_w;
+-    int    best_nph = -1;
+-    int    best_npw = -1;
+-    double best_d   = 0.0;
+-    for (int a = 0; a < 2; ++a) {
+-        for (int b = 0; b < 2; ++b) {
+-            const int nph = hs[a];
+-            const int npw = ws[b];
+-            if (nph < 1 || npw < 1 || nph * npw > max_tokens) {
+-                continue;
+-            }
+-            const double d = std::fabs((double) nph / (double) npw - target_ar);
+-            const int n_tokens      = nph * npw;
+-            const int best_n_tokens = best_nph * best_npw;
+-            if (best_nph < 0 || d < best_d || (d == best_d && n_tokens > best_n_tokens)) {
+-                best_nph = nph;
+-                best_npw = npw;
+-                best_d   = d;
+-            }
+-        }
+-    }
+-    if (best_nph < 0) { // no candidate fit under the cap: round and clamp
+-        best_nph = std::max(1, (int) std::lround(i_nph));
+-        best_npw = std::max(1, (int) std::lround(i_npw));
+-    }
+-    return clip_image_size{ best_npw * patch_hw, best_nph * patch_hw };
+-}
+-
+-mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const clip_image_u8 & img) {
+-    const int patch_hw   = hparams.patch_size * hparams.n_merge;
+-    const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+-    GGML_ASSERT(patch_area > 0 && hparams.image_max_pixels > 0);
+-    const int max_tokens = hparams.image_max_pixels / patch_area;
+-
+-    const clip_image_size original_size = img.get_size();
+-    const clip_image_size target_size   = muse_glimmer_grid_size(
+-        original_size.width, original_size.height, patch_hw, max_tokens);
+-
+-    // PIL resizes directly to (target_w, target_h) -- a stretch, no padding.
+-    clip_image_u8 resized_image;
+-    img_tool::resize(img, resized_image, target_size, hparams.image_resize_algo, PAD_NONE);
+-
+-    mtmd_image_preproc_out output;
+-    output.append(hparams, resized_image, true);
+-    return output;
+-}
+diff --git a/tools/mtmd/mtmd-image.h b/tools/mtmd/mtmd-image.h
+index 11ccd54a4..e2cf69872 100644
+--- a/tools/mtmd/mtmd-image.h
++++ b/tools/mtmd/mtmd-image.h
+@@ -255,9 +255,3 @@ struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
+     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+ };
+-
+-// pick the patch grid closest to the input aspect ratio under the per-image token cap, stretch-resize.
+-struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
+-    mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+-};
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d682b65d1..338406dca 100644
+index d682b65d1..d374dfd42 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -38,10 +38,11 @@
- 
- constexpr int HTTP_POLLING_SECONDS = 1;
- 
--static common_speculative_output_limits server_output_limits(const common_params & params) {
-+static uint32_t server_n_outputs_max(const common_params & params) {
-+    const uint32_t n_batch = params.n_batch;
-     if (params.embedding ||
-             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
--        return { params.n_batch, 1 };
-+        return n_batch;
-     }
- 
-     // Account for draft modes enabled by convenience flags before their types are added.
-@@ -50,11 +51,8 @@ static common_speculative_output_limits server_output_limits(const common_params
+@@ -50,11 +50,12 @@ static common_speculative_output_limits server_output_limits(const common_params
          n_max = std::max(n_max, (uint32_t) std::max(0, params.speculative.draft.n_max));
      }
  
@@ -774,12 +3615,27 @@ index d682b65d1..338406dca 100644
 -    result.total   = std::max<int32_t>(1, result.total);
 -    result.per_seq = std::max<int32_t>(1, result.per_seq);
 -    return result;
-+    const uint64_t n_outputs = (uint64_t) params.n_parallel * (1 + n_max);
-+    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
++    const uint64_t per_seq = 1 + n_max;
++    const uint64_t total = (uint64_t) params.n_parallel * per_seq;
++    return {
++        /* .total   = */ (int32_t) std::max<uint64_t>(1, std::min<uint64_t>(params.n_batch, total)),
++        /* .per_seq = */ (int32_t) std::max<uint64_t>(1, std::min<uint64_t>(params.n_batch, per_seq)),
++    };
  }
  
  // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
-@@ -1542,9 +1540,9 @@ private:
+@@ -1212,7 +1213,9 @@ private:
+         }
+ 
+         params_base = params_load;
+-        params_base.n_outputs_max = server_n_outputs_max(params_base);
++        const auto output_limits = server_output_limits(params_base);
++        params_base.n_outputs_max = output_limits.total;
++        params_base.n_outputs_max_per_seq = output_limits.per_seq;
+ 
+         const bool has_mmproj = !params_base.mmproj.path.empty();
+         const bool has_draft = params_base.speculative.has_dft();
+@@ -1542,9 +1545,9 @@ private:
  
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
@@ -792,7 +3648,7 @@ index d682b65d1..338406dca 100644
              // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
          }
  
-@@ -3053,6 +3051,7 @@ private:
+@@ -3053,6 +3056,7 @@ private:
                      std::string filepath = task.slot_action.filepath;
  
                      size_t nread = 0;
@@ -800,7 +3656,7 @@ index d682b65d1..338406dca 100644
                      try {
                          size_t n_packed = 0;
                          llama_tokens packed;
-@@ -3076,6 +3075,7 @@ private:
+@@ -3076,6 +3080,7 @@ private:
                              throw std::runtime_error("Invalid tokens in slot save file");
                          }
  
@@ -808,7 +3664,7 @@ index d682b65d1..338406dca 100644
                          slot->prompt.clear();
                          slot->prompt.tokens = std::move(restored);
                      } catch (const std::exception & err) {
-@@ -3495,6 +3495,7 @@ private:
+@@ -3495,6 +3500,7 @@ private:
                              /* .drafting = */ true,
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
@@ -816,7 +3672,7 @@ index d682b65d1..338406dca 100644
                              /* .id_last  = */ slot.sampled,
                              /* .prompt   = */ &slot.spec_prompt,
                              /* .result   = */ &slot.spec_draft,
-@@ -3910,7 +3911,7 @@ private:
+@@ -3910,7 +3916,7 @@ private:
                      }
  
                      const int64_t t_now = ggml_time_us();
@@ -825,7 +3681,7 @@ index d682b65d1..338406dca 100644
                      slot.print_timings_pp();
  
                      // truncate any tokens that are beyond n_past for this slot
-@@ -4077,7 +4078,7 @@ private:
+@@ -4077,7 +4083,7 @@ private:
                          // extract the logits only for the last token
                          batch.set_output(batch.size() - 1, true);
  

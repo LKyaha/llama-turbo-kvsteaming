@@ -53,6 +53,7 @@ function Resolve-KnownMergeConflicts {
 
     $allowed = @(
         ".github/workflows/build-wasm.yml",
+        ".github/workflows/build-self-hosted.yml",
         "ggml/src/ggml-metal/ggml-metal.metal"
     )
 
@@ -66,6 +67,10 @@ function Resolve-KnownMergeConflicts {
             ".github/workflows/build-wasm.yml" {
                 Invoke-Git rm -f -- $path
                 Write-Host "Resolved known conflict (feature deletion): $path"
+            }
+            ".github/workflows/build-self-hosted.yml" {
+                Invoke-Git rm -f -- $path
+                Write-Host "Resolved known conflict (upstream deletion): $path"
             }
             "ggml/src/ggml-metal/ggml-metal.metal" {
                 Invoke-Git add -- $path
@@ -620,9 +625,46 @@ function Repair-ValidatedServerMergeDrift {
 
     Invoke-Git apply --check --whitespace=nowarn $patch
     Invoke-Git apply --whitespace=nowarn $patch
-    Invoke-Git add -- common tools
+    Invoke-Git add -- common tools include src ggml/src/ggml-backend.cpp
     Invoke-Git commit -m "integration: repair server and MoE merge drift"
     Write-Host "Applied validated server, speculative, lazy-read, and MoE fit integration repairs."
+}
+
+function Repair-GraphInputTensorCounter {
+    $contextCpp = "src/llama-context.cpp"
+    if (-not (Test-Path $contextCpp)) { return }
+
+    $text = Get-Content $contextCpp -Raw
+    if ($text -notmatch 'llama_graph_n_input_tensors\(gf\)') { return }
+    if ($text -match 'static int llama_graph_n_input_tensors\(') { return }
+
+    $needle = "void llama_context::sched_reserve() {"
+    if (-not $text.Contains($needle)) {
+        throw "llama-context graph input counter has no stable insertion point"
+    }
+    $helper = @'
+static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+            users[node].push_back(node);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (src && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                users[src].push_back(node);
+            }
+        }
+    }
+    return (int) users.size();
+}
+
+'@
+    Set-Content -Path $contextCpp -Value $text.Replace($needle, $helper + $needle) -Encoding UTF8
+    Invoke-Git add -- $contextCpp
+    Invoke-Git commit -m "integration: restore graph input counter helper"
+    Write-Host "Restored the graph input tensor counter required by the merged context diagnostics."
 }
 
 function Repair-CudaFattnSharedMemory {
@@ -752,6 +794,7 @@ try {
         Repair-DflashMergeDrift
         Repair-CommonLazyApiDrift
         Repair-ValidatedServerMergeDrift
+        Repair-GraphInputTensorCounter
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-CudaFattnSharedMemory
