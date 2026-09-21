@@ -449,6 +449,18 @@ function Repair-DflashMergeDrift {
     Write-Host "Applied CPU-validated DFlash feature repair."
 }
 
+function Repair-CommonLazyApiDrift {
+    $patch = Join-Path $PSScriptRoot "patches/validated-common-lazy-api-drift.patch"
+    $path = "common/common.h"
+    $text = Get-Content $path -Raw
+    if ($text -notmatch '\bLLAMA_LAZY_MODE_AUTO\b') { return }
+    Invoke-Git apply --check $patch
+    Invoke-Git apply $patch
+    Invoke-Git add -- $path
+    Invoke-Git commit -m "integration: remove stale common lazy mode API"
+    Write-Host "Removed the obsolete common lazy-mode enum after the public lazy API migration."
+}
+
 function Repair-CublasHandleApiDrift {
     $mmvqTq = "ggml/src/ggml-cuda/mmvq-tq.cu"
     if (-not (Test-Path $mmvqTq)) {
@@ -721,6 +733,7 @@ try {
         Repair-ValidatedMainlineMergeDrift
         Repair-DsaIswaMergeDrift -MainlineSha $mainlineSha
         Repair-DflashMergeDrift
+        Repair-CommonLazyApiDrift
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-CudaFattnSharedMemory
