@@ -608,6 +608,23 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     }
 }
 
+function Repair-ValidatedServerMergeDrift {
+    $patch = Join-Path $PSScriptRoot "patches/validated-server-merge-drift.patch"
+    if (-not (Test-Path $patch)) { throw "Validated server merge-drift patch is missing: $patch" }
+
+    & git apply --reverse --check $patch
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Validated server merge-drift patch already applied."
+        return
+    }
+
+    Invoke-Git apply --check --whitespace=nowarn $patch
+    Invoke-Git apply --whitespace=nowarn $patch
+    Invoke-Git add -- common tools
+    Invoke-Git commit -m "integration: repair server and MoE merge drift"
+    Write-Host "Applied validated server, speculative, lazy-read, and MoE fit integration repairs."
+}
+
 function Repair-CudaFattnSharedMemory {
     $fattnVec = "ggml/src/ggml-cuda/fattn-vec.cuh"
     if (-not (Test-Path $fattnVec)) { return }
@@ -734,6 +751,7 @@ try {
         Repair-DsaIswaMergeDrift -MainlineSha $mainlineSha
         Repair-DflashMergeDrift
         Repair-CommonLazyApiDrift
+        Repair-ValidatedServerMergeDrift
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-CudaFattnSharedMemory

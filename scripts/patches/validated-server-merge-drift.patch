@@ -1,0 +1,1103 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd9a..e55f04f5d 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1320,6 +1320,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+             params.tensor_split,
+             params.tensor_buft_overrides.data(),
++            &params.moe_cache,
+             params.fit_params_target.data(),
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+@@ -1687,7 +1688,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.main_gpu        = params.main_gpu;
+     mparams.split_mode      = params.split_mode;
+     mparams.load_mode       = params.load_mode;
+-    mparams.lazy_mode = params.lazy_mode;
++    mparams.tensor_read_lazy = params.tensor_read_lazy;
+     mparams.tensor_split    = params.tensor_split;
+     mparams.check_tensors   = params.check_tensors;
+     mparams.use_extra_bufts = !params.no_extra_bufts;
+@@ -1722,7 +1723,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_seq_max         = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+-    cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+     cparams.n_batch           = params.n_batch;
+     cparams.n_ubatch          = params.n_ubatch;
+     cparams.n_threads         = params.cpuparams.n_threads;
+diff --git a/common/common.h b/common/common.h
+index e3f306296..eca4cd651 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -509,8 +509,6 @@ struct common_params {
+     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+ 
+-    enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+-
+     enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
+ 
+     common_cpu_params cpuparams;
+diff --git a/common/fit.cpp b/common/fit.cpp
+index faa595f84..d5175bc43 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -1,9 +1,11 @@
+ #include "fit.h"
+ 
++#include "common.h"
+ #include "json.h"
+ #include "log.h"
+ 
+ #include "../src/llama-ext.h"
++#include "../ggml/src/ggml-backend-moe-cache.h"
+ 
+ #include <array>
+ #include <cassert>
+@@ -13,6 +15,10 @@
+ #include <string>
+ #include <vector>
+ 
++const char * common_moe_cache_tensor_override_pattern() {
++    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
++}
++
+ // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
+ // enum to identify part of a layer for distributing its tensors:
+ enum common_layer_fraction_t {
+@@ -27,6 +33,8 @@ class common_params_fit_exception : public std::runtime_error {
+     using std::runtime_error::runtime_error;
+ };
+ 
++#include "fit-moe.inc"
++
+ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         const char * path_model,
+         const llama_model_params * mparams,
+@@ -35,7 +43,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         uint32_t & hp_ngl,
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+-        ggml_log_level log_level) {
++        ggml_log_level log_level,
++        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr) {
+     struct user_data_t {
+         struct {
+             ggml_log_callback callback;
+@@ -63,6 +72,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         throw std::runtime_error("failed to load model");
+     }
+ 
++    if (moe_tensors) {
++        moe_tensors->resize(llama_model_get_moe_tensor_info(model, nullptr, 0));
++        llama_model_get_moe_tensor_info(model, moe_tensors->data(), moe_tensors->size());
++    }
++
+     llama_context * ctx = llama_init_from_model(model, *cparams);
+     if (ctx == nullptr) {
+         llama_model_free(model);
+@@ -176,10 +190,44 @@ common_device_memory_data_vec common_get_device_memory_data(
+     return ret;
+ }
+ 
++common_device_memory_data_vec common_get_device_memory_data_with_parent(
++        const char * path_model,
++        const llama_model_params * mparams,
++        const llama_context_params * cparams,
++        const char * path_parent,
++        const llama_model_params * mparams_parent,
++        const llama_context_params * cparams_parent,
++        std::vector<ggml_backend_dev_t> & devs,
++        uint32_t & hp_ngl,
++        uint32_t & hp_n_ctx_train,
++        uint32_t & hp_n_expert,
++        ggml_log_level log_level) {
++    llama_model_params parent = *mparams_parent;
++    parent.no_alloc  = true;
++    parent.load_mode = LLAMA_LOAD_MODE_NONE;
++    llama_model * model_parent = llama_model_load_from_file(path_parent, parent);
++    if (!model_parent) {
++        throw std::runtime_error("failed to load parent model");
++    }
++    llama_context * ctx_parent = llama_init_from_model(model_parent, *cparams_parent);
++    if (!ctx_parent) {
++        llama_model_free(model_parent);
++        throw std::runtime_error("failed to create parent llama_context");
++    }
++    // The current memory probe does not accept a parent context. Keep the parent
++    // alive while measuring so backend allocation and device placement match it.
++    const auto result = common_get_device_memory_data(path_model, mparams, cparams, devs,
++            hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
++    llama_free(ctx_parent);
++    llama_model_free(model_parent);
++    return result;
++}
++
+ static void common_params_fit_impl(
+         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
++        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra,
++        common_moe_cache_params * moe_cache, enum ggml_log_level log_level) {
+     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+     }
+@@ -261,7 +309,9 @@ static void common_params_fit_impl(
+     // step 1: get data for default parameters and check whether any changes are necessary in the first place
+ 
+     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++    std::vector<llama_moe_tensor_info> moe_tensors;
++    dmds_t dmds_full = common_get_device_memory_data_impl(
++            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &moe_tensors);
+ 
+     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
+@@ -614,6 +664,7 @@ static void common_params_fit_impl(
+     };
+ 
+     int64_t global_surplus_cpu_moe = 0;
++    dmds_t dmds_cpu_moe;
+     if (hp_nex > 0) {
+         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
+         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+@@ -622,7 +673,7 @@ static void common_params_fit_impl(
+         mparams->tensor_buft_overrides = tensor_buft_overrides;
+ 
+         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
+-        dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
++        dmds_cpu_moe = common_get_device_memory_data_impl(
+             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+         add_extra_memory(dmds_cpu_moe);
+ 
+@@ -727,8 +778,26 @@ static void common_params_fit_impl(
+             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+     }
++    auto set_moe_cache_placement = [&]() {
++        if (!moe_cache || hp_nex == 0 || dmds_cpu_moe.empty()) return;
++        const common_moe_cache_fit_result fit = common_moe_cache_evaluate_fit(
++                moe_cache, moe_tensors, devs, dmds_cpu_moe, margins);
++        if (!fit.feasible) {
++            LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, fit.reason.c_str());
++            return;
++        }
++        const size_t ntbo = llama_max_tensor_buft_overrides();
++        for (size_t i = ntbo - 1; i > 0; --i) tensor_buft_overrides[i] = tensor_buft_overrides[i - 1];
++        tensor_buft_overrides[0] = { common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type() };
++        mparams->tensor_buft_overrides = tensor_buft_overrides;
++        moe_cache->fit_selected = true;
++        LOG_INF("%s: MoE cache fit selected %zu MiB cache capacity for %zu MiB of routed experts\n",
++                __func__, fit.cache_bytes >> 20, fit.expert_bytes >> 20);
++    };
++
+     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
++        set_moe_cache_placement();
+         return;
+     }
+ 
+@@ -874,6 +943,7 @@ static void common_params_fit_impl(
+     }
+ 
+     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
++    set_moe_cache_placement();
+ }
+ 
+ enum common_params_fit_status common_fit_params(
+@@ -889,7 +959,7 @@ enum common_params_fit_status common_fit_params(
+     const int64_t t0_us = llama_time_us();
+     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+     try {
+-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
++        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, nullptr, log_level);
+         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+     } catch (const common_params_fit_exception & e) {
+         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+@@ -903,6 +973,32 @@ enum common_params_fit_status common_fit_params(
+     return status;
+ }
+ 
++common_params_fit_status common_fit_params(
++        const char * path_model,
++        llama_model_params * mparams,
++        llama_context_params * cparams,
++        float * tensor_split,
++        llama_model_tensor_buft_override * tensor_buft_overrides,
++        common_moe_cache_params * moe_cache,
++        size_t * margins,
++        uint32_t n_ctx_min,
++        const common_fit_extra_model * extra,
++        ggml_log_level log_level) {
++    const int64_t t0_us = llama_time_us();
++    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
++    if (moe_cache) moe_cache->fit_selected = false;
++    try {
++        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
++                margins, n_ctx_min, extra, moe_cache, log_level);
++    } catch (const common_params_fit_exception &) {
++        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
++    } catch (const std::runtime_error &) {
++        status = COMMON_PARAMS_FIT_STATUS_ERROR;
++    }
++    LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (llama_time_us() - t0_us) * 1e-6);
++    return status;
++}
++
+ void common_memory_breakdown_print(const struct llama_context * ctx) {
+     //const auto & devices = ctx->get_model().devices;
+     const auto * model = llama_get_model(ctx);
+diff --git a/common/fit.h b/common/fit.h
+index 824d386b0..b5d2ff328 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -3,8 +3,14 @@
+ #include "ggml.h"
+ #include "llama.h"
+ 
++#include "fit-moe-public.h"
++
+ #include <vector>
+ 
++struct common_moe_cache_params;
++
++const char * common_moe_cache_tensor_override_pattern();
++
+ enum common_params_fit_status {
+     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
+     COMMON_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
+@@ -37,6 +43,20 @@ common_params_fit_status common_fit_params(
+       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
+                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+ 
++// Fit a model with routed-expert cache placement enabled when the selected
++// provider and device margins can hold complete cache pools.
++common_params_fit_status common_fit_params(
++                         const char * path_model,
++                 llama_model_params * mparams,
++               llama_context_params * cparams,
++                              float * tensor_split,
++   llama_model_tensor_buft_override * tensor_buft_overrides,
++           common_moe_cache_params * moe_cache,
++                             size_t * margins,
++                           uint32_t   n_ctx_min,
++      const common_fit_extra_model * extra,
++                     ggml_log_level   log_level);
++
+ // print estimated memory to stdout
+ void common_fit_print(
+                          const char * path_model,
+@@ -65,3 +85,17 @@ common_device_memory_data_vec common_get_device_memory_data(
+                            uint32_t & hp_n_ctx_train,
+                            uint32_t & hp_n_expert,
+                      ggml_log_level   log_level);
++
++// Measure a child model with a no-alloc parent model/context already resident.
++common_device_memory_data_vec common_get_device_memory_data_with_parent(
++                         const char * path_model,
++           const llama_model_params * mparams,
++         const llama_context_params * cparams,
++                         const char * path_parent,
++           const llama_model_params * mparams_parent,
++         const llama_context_params * cparams_parent,
++    std::vector<ggml_backend_dev_t> & devs,
++                           uint32_t & hp_ngl,
++                           uint32_t & hp_n_ctx_train,
++                           uint32_t & hp_n_expert,
++                     ggml_log_level   log_level);
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 8d815b9a0..97faa5d62 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "common.h"
+ #include "ggml.h"
++#include "ggml-cpp.h"
+ #include "llama.h"
+ #include "log.h"
+ #include "ngram-cache.h"
+@@ -303,7 +304,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+             drafting[seq_id] = true;
+             common_sampler_reset(smpls[seq_id].get());
+ 
+-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
++            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+         }
+ 
+         int ret = llama_decode(ctx_dft, batch);
+@@ -362,7 +363,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+                     continue;
+                 }
+ 
+-                common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
++                common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
+             }
+ 
+             if (batch.n_tokens == 0) {
+@@ -1245,13 +1246,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+             common_sampler_reset(smpls[seq_id].get());
+ 
+-            // dp.n_past is the slot's token count. For an M-RoPE target that is no longer the
++            // dp.pos0 is the slot's token count. For an M-RoPE target that is no longer the
+             // next position once an image has been in the prompt (image tokens advance the
+             // position by the grid size, not by their count), and a noise block placed at the
+             // token count sits hundreds of positions past the draft's own cache. Take the next
+             // position from the target's memory instead; without images the two are equal.
+             const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
+-            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.n_past;
++            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.pos0;
+ 
+             const int32_t n_draft = params.n_max;
+ 
+@@ -1942,7 +1943,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 // deferred rows at or past n_past hold candidates the verify
+                 // rejected; the committed prefix ends at n_past - 1. Drop them.
+-                drop_deferred_from(seq_one, dp.n_past);
++                drop_deferred_from(seq_one, dp.pos0);
+ 
+                 // rows of other sequences cannot join a single-sequence chain
+                 // batch; decode all remaining rows standalone in that case
+@@ -1968,7 +1969,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 defer.embd.clear();
+ 
+                 for (int j = 0; j < n_chain; ++j) {
+-                    common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.n_past + j, { seq_one }, true);
++                    common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.pos0 + j, { seq_one }, true);
+                     if (j == 0) {
+                         std::memcpy(batch.embd + (size_t) n_catchup * n_embd, pending_h[seq_one].data(), row_bytes);
+                     } else {
+@@ -2064,7 +2065,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (any_drafting && !defer.tok.empty()) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 if (dparams[seq_id].drafting) {
+-                    drop_deferred_from(seq_id, dparams[seq_id].n_past);
++                    drop_deferred_from(seq_id, dparams[seq_id].pos0);
+                 }
+             }
+         }
+@@ -2097,7 +2098,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 n_cap[seq_id] = dp.n_max;
+             }
+ 
+-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
++            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
+             i_last[seq_id] = batch.n_tokens - 1;
+@@ -2120,7 +2121,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * mem_dft = llama_get_memory(ctx_dft);
+                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                     if (drafting[seq_id]) {
+-                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].n_past, -1);
++                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
+                     }
+                 }
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+@@ -2186,19 +2187,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
+                     for (int t = 0; t < n_rows; ++t) {
+                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
+-                        common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
++                        common_batch_add(batch, tok, dp.pos0 + t, { seq_id }, t == n_rows - 1);
+                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
+                     }
+                 } else if (same_position_draft) {
+                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+-                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
++                    common_batch_add(batch, id, dp.pos0, { seq_id }, true);
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 } else {
+                     // is_mem_shared models with a real trained NextN head (qwen35, qwen4exp, ...)
+                     // still draft at incrementing positions, same as the non-shared-memory path
+-                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
++                    common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
+                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                 }
+ 
+@@ -2705,6 +2706,9 @@ struct common_speculative {
+ 
+     // which implementaion was used for a given seq_id
+     std::vector<common_speculative_impl *> impl_last;
++
++    std::vector<double> synth_probs;
++    int32_t n_max = 0;
+ };
+ 
+ static common_ngram_map get_common_ngram_map(
+@@ -2803,6 +2807,25 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
+     return it->second;
+ }
+ 
++std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
++    gguf_init_params params = { true, nullptr };
++    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), params));
++    if (!ctx) return {};
++    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
++    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) return {};
++    const std::string arch = gguf_get_val_str(ctx.get(), arch_id);
++    if (arch != "dflash") {
++        const int64_t blocks_key = gguf_find_key(ctx.get(), (arch + ".block_count").c_str());
++        if (blocks_key < 0) return {};
++        const uint32_t blocks = gguf_get_val_u32(ctx.get(), blocks_key);
++        return gguf_find_tensor(ctx.get(), ("blk." + std::to_string(blocks - 1) + ".nextn.eh_proj.weight").c_str()) >= 0
++            ? std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
++            : std::vector<common_speculative_type>{};
++    }
++    return { gguf_find_tensor(ctx.get(), "markov_w1.weight") >= 0
++        ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
++}
++
+ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
+     uint32_t result = 0;
+     for (size_t i = 0; i < configs.size(); i++) {
+@@ -2848,6 +2871,50 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+     return n_max;
+ }
+ 
++int32_t common_speculative_n_max(const common_speculative * spec) {
++    return spec == nullptr ? 0 : spec->n_max;
++}
++
++std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {
++    const bool has_length = spec->synth_len != -1.0;
++    const bool has_rates = !spec->synth_rates.empty();
++    if (!has_length && !has_rates) return {};
++    if (has_length && has_rates) throw std::invalid_argument("synthetic acceptance length and rates are mutually exclusive");
++    if (n_max <= 0) throw std::invalid_argument("synthetic acceptance requires at least one speculative token");
++    if (has_rates) {
++        if (spec->synth_rates.size() != (size_t) n_max) throw std::invalid_argument("synthetic acceptance rates have an invalid length");
++        for (size_t i = 0; i < spec->synth_rates.size(); ++i) {
++            const double rate = spec->synth_rates[i];
++            if (!std::isfinite(rate) || rate < 0.0 || rate > 1.0 || (i > 0 && rate > spec->synth_rates[i - 1])) {
++                throw std::invalid_argument("synthetic acceptance rates must be finite, within [0, 1], and non-increasing");
++            }
++        }
++        return spec->synth_rates;
++    }
++    const double length_max = (double) n_max + 1.0;
++    if (!std::isfinite(spec->synth_len) || spec->synth_len < 1.0 || spec->synth_len > length_max) {
++        throw std::invalid_argument("synthetic acceptance length is outside its valid range");
++    }
++    double p_min = 0.0;
++    double p_max = spec->synth_len == length_max ? 1.0 : 1.0;
++    for (int i = 0; i < 32 && spec->synth_len != length_max; ++i) {
++        const double p = 0.5 * (p_min + p_max);
++        double sum = 0.0;
++        double term = p;
++        for (int32_t j = 0; j < n_max; ++j) { sum += term; term *= p; }
++        if (sum < spec->synth_len - 1.0) p_min = p; else p_max = p;
++    }
++    std::vector<double> rates;
++    double rate = spec->synth_len == length_max ? 1.0 : 0.5 * (p_min + p_max);
++    for (int32_t i = 0; i < n_max; ++i) { rates.push_back(rate); rate *= (spec->synth_len == length_max ? 1.0 : 0.5 * (p_min + p_max)); }
++    return rates;
++}
++
++const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
++    GGML_ASSERT(spec);
++    return spec->synth_probs;
++}
++
+ common_params common_base_params_to_speculative(const common_params & params) {
+     const bool has_draft = params.speculative.has_dft();
+ 
+@@ -3123,11 +3190,21 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+     }
+ 
+     auto * result = new common_speculative {
+-        /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
+-        /* .impls     = */ std::move(impls),
+-        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
++        /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
++        /* .impls       = */ std::move(impls),
++        /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
++        /* .synth_probs = */ {},
++        /* .n_max       = */ common_speculative_n_max(&params),
+     };
+ 
++    const auto rates = common_speculative_synth_rates_resolve(&params, common_speculative_n_max(&params));
++    result->synth_probs.reserve(rates.size());
++    double rate_prev = 1.0;
++    for (const double rate : rates) {
++        result->synth_probs.push_back(rate_prev > 0.0 ? rate / rate_prev : 0.0);
++        rate_prev = rate;
++    }
++
+     return result;
+ }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index c968750e2..3b704fb74 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -62,6 +62,9 @@ struct common_speculative_draft_params {
+     int32_t n_max = -1;
+ 
+     llama_pos   pos0;
++    // Number of committed tokens in this sequence's draft cache.  Draft
++    // implementations use it as the first position for their next batch.
++    int32_t     n_past = 0;
+     llama_token id_last;
+ 
+     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 5bef7d529..add8a64d3 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -272,13 +272,13 @@ static const char * split_mode_str(llama_split_mode mode) {
+     }
+ }
+ 
+-static const char * lazy_mode_str(llama_lazy_mode mode) {
++static const char * lazy_mode_str(llama_tensor_read_lazy mode) {
+     switch (mode) {
+-        case LLAMA_LAZY_MODE_OFF:
++        case LLAMA_TENSOR_READ_LAZY_OFF:
+             return "off";
+-        case LLAMA_LAZY_MODE_AUTO:
++        case LLAMA_TENSOR_READ_LAZY_AUTO:
+             return "auto";
+-        case LLAMA_LAZY_MODE_ON:
++        case LLAMA_TENSOR_READ_LAZY_ON:
+             return "on";
+         default:
+             GGML_ABORT("invalid lazy mode");
+@@ -438,7 +438,7 @@ struct cmd_params {
+     std::string                      repack;
+     std::vector<llama_split_mode>    split_mode;
+     std::vector<llama_load_mode>     load_mode;
+-    std::vector<llama_lazy_mode>     lazy_mode;
++    std::vector<llama_tensor_read_lazy>     tensor_read_lazy;
+     std::vector<int>                 main_gpu;
+     std::vector<bool>                no_kv_offload;
+     std::vector<llama_flash_attn_type> flash_attn;
+@@ -489,7 +489,7 @@ static const cmd_params cmd_params_defaults = {
+     /* repack               */ "auto",
+     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
+     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
+-    /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
++    /* tensor_read_lazy            */ { LLAMA_TENSOR_READ_LAZY_AUTO },
+     /* main_gpu             */ { 0 },
+     /* no_kv_offload        */ { false },
+     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
+@@ -574,7 +574,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
+     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
+     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+-    printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
++    printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.tensor_read_lazy, lazy_mode_str), ",").c_str());
+     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
+     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
+     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
+@@ -961,15 +961,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 }
+                 auto p = string_split<std::string>(argv[i], split_delim);
+ 
+-                std::vector<llama_lazy_mode> modes;
++                std::vector<llama_tensor_read_lazy> modes;
+                 for (const auto & m : p) {
+-                    llama_lazy_mode mode;
++                    llama_tensor_read_lazy mode;
+                     if (m == "on") {
+-                        mode = LLAMA_LAZY_MODE_ON;
++                        mode = LLAMA_TENSOR_READ_LAZY_ON;
+                     } else if (m == "auto") {
+-                        mode = LLAMA_LAZY_MODE_AUTO;
++                        mode = LLAMA_TENSOR_READ_LAZY_AUTO;
+                     } else if (m == "off") {
+-                        mode = LLAMA_LAZY_MODE_OFF;
++                        mode = LLAMA_TENSOR_READ_LAZY_OFF;
+                     } else {
+                         invalid_param = true;
+                         break;
+@@ -979,7 +979,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 if (invalid_param) {
+                     break;
+                 }
+-                params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
++                params.tensor_read_lazy.insert(params.tensor_read_lazy.end(), modes.begin(), modes.end());
+             } else if (arg == "-mg" || arg == "--main-gpu") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1301,8 +1301,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+     if (params.load_mode.empty()) {
+         params.load_mode = cmd_params_defaults.load_mode;
+     }
+-    if (params.lazy_mode.empty()) {
+-        params.lazy_mode = cmd_params_defaults.lazy_mode;
++    if (params.tensor_read_lazy.empty()) {
++        params.tensor_read_lazy = cmd_params_defaults.tensor_read_lazy;
+     }
+     if (params.main_gpu.empty()) {
+         params.main_gpu = cmd_params_defaults.main_gpu;
+@@ -1384,7 +1384,7 @@ struct cmd_params_instance {
+     bool               repack;
+     llama_split_mode   split_mode;
+     llama_load_mode    load_mode;
+-    llama_lazy_mode    lazy_mode;
++    llama_tensor_read_lazy    tensor_read_lazy;
+     int                main_gpu;
+     bool               no_kv_offload;
+     llama_flash_attn_type flash_attn;
+@@ -1406,7 +1406,7 @@ struct cmd_params_instance {
+         }
+         mparams.split_mode    = split_mode;
+         mparams.load_mode     = load_mode;
+-        mparams.lazy_mode     = lazy_mode;
++        mparams.tensor_read_lazy     = tensor_read_lazy;
+         mparams.main_gpu      = main_gpu;
+         mparams.tensor_split  = tensor_split.data();
+         mparams.use_extra_bufts = repack;
+@@ -1456,7 +1456,7 @@ struct cmd_params_instance {
+                repack == other.repack &&
+                split_mode == other.split_mode &&
+                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
+-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
++               load_mode == other.load_mode && tensor_read_lazy == other.tensor_read_lazy &&
+                devices == other.devices && no_host == other.no_host &&
+                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
+     }
+@@ -1492,7 +1492,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+     for (const auto & mc : params.moe_cache)
+     for (const auto & sm : params.split_mode)
+     for (const auto & lm : params.load_mode)
+-    for (const auto & lzm : params.lazy_mode)
++    for (const auto & lzm : params.tensor_read_lazy)
+     for (const auto & mg : params.main_gpu)
+     for (const auto & devs : params.devices)
+     for (const auto & ts : params.tensor_split)
+@@ -1535,7 +1535,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .repack                = */ get_effective_repack(mc, params.repack),
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+-                /* .lazy_mode             = */ lzm,
++                /* .tensor_read_lazy             = */ lzm,
+                 /* .main_gpu              = */ mg,
+                 /* .no_kv_offload         = */ nkvo,
+                 /* .flash_attn            = */ fa,
+@@ -1575,7 +1575,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .repack                = */ get_effective_repack(mc, params.repack),
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+-                /* .lazy_mode             = */ lzm,
++                /* .tensor_read_lazy             = */ lzm,
+                 /* .main_gpu              = */ mg,
+                 /* .no_kv_offload         = */ nkvo,
+                 /* .flash_attn            = */ fa,
+@@ -1615,7 +1615,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .repack                = */ get_effective_repack(mc, params.repack),
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+-                /* .lazy_mode             = */ lzm,
++                /* .tensor_read_lazy             = */ lzm,
+                 /* .main_gpu              = */ mg,
+                 /* .no_kv_offload         = */ nkvo,
+                 /* .flash_attn            = */ fa,
+@@ -1660,7 +1660,7 @@ struct test {
+     bool                     repack;
+     llama_split_mode         split_mode;
+     llama_load_mode          load_mode;
+-    llama_lazy_mode          lazy_mode;
++    llama_tensor_read_lazy          tensor_read_lazy;
+     int                      main_gpu;
+     bool                     no_kv_offload;
+     llama_flash_attn_type    flash_attn;
+@@ -1795,7 +1795,7 @@ struct test {
+             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache",
+             "moe_cache_fit",  "repack",         "split_mode",
+             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+-            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
++            "tensor_buft_overrides",            "load_mode",     "tensor_read_lazy",
+             "embeddings",
+             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
+             "n_prompt",       "n_gen",          "n_gen_warmup",  "n_depth",
+@@ -1822,7 +1822,7 @@ struct test {
+         if (field == "avg_ts" || field == "stddev_ts") {
+             return FLOAT;
+         }
+-        if (field == "load_mode" || field == "lazy_mode") {
++        if (field == "load_mode" || field == "tensor_read_lazy") {
+             return STRING;
+         }
+         return STRING;
+@@ -1895,7 +1895,7 @@ struct test {
+                                             tensor_split_str,
+                                             tensor_buft_overrides_str,
+                                             llama_load_mode_name(load_mode),
+-                                            lazy_mode_str(lazy_mode),
++                                            lazy_mode_str(tensor_read_lazy),
+                                             std::to_string(embeddings),
+                                             std::to_string(no_op_offload),
+                                             std::to_string(no_host),
+@@ -2254,8 +2254,8 @@ struct markdown_printer : public printer {
+         if (params.load_mode.size() > 1 || params.load_mode != cmd_params_defaults.load_mode) {
+             fields.emplace_back("load_mode");
+         }
+-        if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
+-            fields.emplace_back("lazy_mode");
++        if (params.tensor_read_lazy.size() > 1 || params.tensor_read_lazy != cmd_params_defaults.tensor_read_lazy) {
++            fields.emplace_back("tensor_read_lazy");
+         }
+         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
+             fields.emplace_back("embeddings");
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d682b65d1..338406dca 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -38,10 +38,11 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
+-static common_speculative_output_limits server_output_limits(const common_params & params) {
++static uint32_t server_n_outputs_max(const common_params & params) {
++    const uint32_t n_batch = params.n_batch;
+     if (params.embedding ||
+             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+-        return { params.n_batch, 1 };
++        return n_batch;
+     }
+ 
+     // Account for draft modes enabled by convenience flags before their types are added.
+@@ -50,11 +51,8 @@ static common_speculative_output_limits server_output_limits(const common_params
+         n_max = std::max(n_max, (uint32_t) std::max(0, params.speculative.draft.n_max));
+     }
+ 
+-    const uint32_t n_outputs_per_seq = 1 + n_max;
+-
+-    result.total   = std::max<int32_t>(1, result.total);
+-    result.per_seq = std::max<int32_t>(1, result.per_seq);
+-    return result;
++    const uint64_t n_outputs = (uint64_t) params.n_parallel * (1 + n_max);
++    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+ }
+ 
+ // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
+@@ -1542,9 +1540,9 @@ private:
+ 
+         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+ 
+-        int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+-        if (n_ctx_slot > n_ctx_train) {
+-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
++        int n_ctx_seq = llama_n_ctx_seq(ctx_tgt);
++        if (n_ctx_seq > n_ctx_train) {
++            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_seq, n_ctx_train);
+             // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
+         }
+ 
+@@ -3053,6 +3051,7 @@ private:
+                     std::string filepath = task.slot_action.filepath;
+ 
+                     size_t nread = 0;
++                    size_t token_count = 0;
+                     try {
+                         size_t n_packed = 0;
+                         llama_tokens packed;
+@@ -3076,6 +3075,7 @@ private:
+                             throw std::runtime_error("Invalid tokens in slot save file");
+                         }
+ 
++                        token_count = restored.size();
+                         slot->prompt.clear();
+                         slot->prompt.tokens = std::move(restored);
+                     } catch (const std::exception & err) {
+@@ -3495,6 +3495,7 @@ private:
+                             /* .drafting = */ true,
+                             /* .n_max    = */ n_draft_max,
+                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
++                            /* .n_past   = */ slot.prompt.n_tokens(),
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
+@@ -3910,7 +3911,7 @@ private:
+                     }
+ 
+                     const int64_t t_now = ggml_time_us();
+-                    slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
++                    slot.stats.set_prompt_last(t_now);
+                     slot.print_timings_pp();
+ 
+                     // truncate any tokens that are beyond n_past for this slot
+@@ -4077,7 +4078,7 @@ private:
+                         // extract the logits only for the last token
+                         batch.set_output(batch.size() - 1, true);
+ 
+-                        slot.n_decoded = 0;
++                        slot.stats.n_gen = 0;
+                         slot.i_batch   = batch.size() - 1;
+                         slot.prompt_checkpoint_restored = false;
+ 
+diff --git a/common/fit-moe-public.h b/common/fit-moe-public.h
+new file mode 100644
+index 000000000..24d25daa9
+--- /dev/null
++++ b/common/fit-moe-public.h
+@@ -0,0 +1,46 @@
++// Public declarations extracted from 461e61a7c common/fit.h, lines 10-53.
++// Merge these declarations into common/fit.h (already has common_moe_cache_params).
++#include <cstdint>
++#include <string>
++#include <vector>
++
++struct common_moe_cache_fit_device_input {
++    int physical_device = -1;
++    int compute_capability = 0;
++    int64_t free_bytes = 0;
++    size_t used_bytes = 0;
++};
++
++struct common_moe_cache_fit_shape_input {
++    enum ggml_type type = GGML_TYPE_COUNT;
++    size_t expert_size = 0;
++    size_t tensor_bytes = 0;
++    size_t scratch_bytes = 0;
++    size_t pool_bytes = 0;
++    bool cacheable = false;
++};
++
++struct common_moe_cache_fit_device {
++    int physical_device = -1;
++    int compute_capability = 0;
++    int64_t free_bytes = 0;
++    int64_t used_bytes = 0;
++    size_t cache_bytes = 0;
++};
++
++struct common_moe_cache_fit_result {
++    bool feasible = false;
++    std::string reason;
++    std::vector<common_moe_cache_fit_device> devices;
++    size_t expert_bytes = 0;
++    size_t cache_bytes = 0;
++    size_t minimum_device_bytes = 0;
++};
++
++common_moe_cache_fit_result common_moe_cache_plan_fit(
++        const std::vector<common_moe_cache_fit_device_input> & devices,
++        const std::vector<common_moe_cache_fit_shape_input> & shapes,
++        size_t reserve_bytes,
++        size_t budget_bytes,
++        int min_devices,
++        size_t minimum_slab_bytes = 0);
+diff --git a/common/fit-moe.inc b/common/fit-moe.inc
+new file mode 100644
+index 000000000..2ad90110b
+--- /dev/null
++++ b/common/fit-moe.inc
+@@ -0,0 +1,209 @@
++// Restoration extracted from 461e61a7c (feature branch common/fit.cpp), lines 32-279.
++// Include after common_moe_cache_tensor_override_pattern() and before fit implementation.
++// Required headers: common.h, log.h, ../ggml/src/ggml-backend-moe-cache.h,
++// ../src/llama-ext.h, <algorithm>, <cstdint>, <vector>.
++
++struct common_moe_cache_fit_pool {
++    ggml_type type = GGML_TYPE_COUNT;
++    size_t expert_size = 0;
++    size_t pool_bytes = 0;
++    size_t tensor_bytes = 0;
++    size_t scratch_bytes = 0;
++};
++
++common_moe_cache_fit_result common_moe_cache_plan_fit(
++        const std::vector<common_moe_cache_fit_device_input> & device_inputs,
++        const std::vector<common_moe_cache_fit_shape_input> & shapes,
++        size_t reserve_bytes,
++        size_t budget_bytes,
++        int min_devices,
++        size_t minimum_slab_bytes) {
++    common_moe_cache_fit_result result;
++
++    for (const common_moe_cache_fit_device_input & input : device_inputs) {
++        if (input.physical_device < 0 || input.free_bytes < 0 || input.used_bytes > INT64_MAX) {
++            result.reason = "device memory accounting overflowed";
++            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++            return result;
++        }
++
++        size_t device_index = result.devices.size();
++        for (size_t candidate = 0; candidate < result.devices.size(); candidate++) {
++            if (result.devices[candidate].physical_device == input.physical_device) {
++                device_index = candidate;
++                break;
++            }
++        }
++        if (device_index == result.devices.size()) {
++            common_moe_cache_fit_device device;
++            device.physical_device = input.physical_device;
++            device.compute_capability = input.compute_capability;
++            device.free_bytes = input.free_bytes;
++            result.devices.push_back(device);
++        }
++
++        common_moe_cache_fit_device & device = result.devices[device_index];
++        device.free_bytes = std::min(device.free_bytes, input.free_bytes);
++        device.compute_capability = std::min(device.compute_capability, input.compute_capability);
++        if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
++            result.reason = "device memory accounting overflowed";
++            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++            return result;
++        }
++        device.used_bytes += (int64_t)input.used_bytes;
++    }
++    if (result.devices.empty()) {
++        result.reason = "no selected device satisfies the cache hardware policy";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++
++    for (common_moe_cache_fit_device & device : result.devices) {
++        const int64_t projected_free = device.free_bytes - device.used_bytes;
++        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) continue;
++        device.cache_bytes = (size_t)projected_free - reserve_bytes;
++        if (budget_bytes > 0) device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
++    }
++
++    std::vector<common_moe_cache_fit_pool> pools;
++    for (const common_moe_cache_fit_shape_input & shape : shapes) {
++        if (shape.tensor_bytes == 0 || shape.tensor_bytes > SIZE_MAX - result.expert_bytes) {
++            result.reason = "the routed expert tensor inventory overflowed";
++            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++            return result;
++        }
++        result.expert_bytes += shape.tensor_bytes;
++        if (!shape.cacheable) continue;
++        bool found = false;
++        for (common_moe_cache_fit_pool & pool : pools) {
++            if (pool.type == shape.type && pool.expert_size == shape.expert_size) {
++                pool.pool_bytes = std::max(pool.pool_bytes, shape.pool_bytes);
++                pool.tensor_bytes += shape.tensor_bytes;
++                pool.scratch_bytes = std::max(pool.scratch_bytes, shape.scratch_bytes);
++                found = true;
++                break;
++            }
++        }
++        if (!found) pools.push_back({shape.type, shape.expert_size, shape.pool_bytes,
++                shape.tensor_bytes, shape.scratch_bytes});
++    }
++
++    size_t scratch_bytes = 0;
++    size_t supported_bytes = 0;
++    for (const common_moe_cache_fit_pool & pool : pools) {
++        if (pool.tensor_bytes < pool.pool_bytes) continue;
++        supported_bytes += pool.tensor_bytes;
++        scratch_bytes = std::max(scratch_bytes, pool.scratch_bytes);
++    }
++    if (supported_bytes == 0) {
++        result.reason = "no routed expert shape is cacheable";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++    if (supported_bytes != result.expert_bytes) {
++        result.reason = "some routed expert weights would remain permanently uncached";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++
++    size_t minimum_pool_bytes = 0;
++    for (const common_moe_cache_fit_pool & pool : pools) {
++        if (pool.tensor_bytes < pool.pool_bytes) continue;
++        if (pool.pool_bytes > SIZE_MAX - minimum_pool_bytes) {
++            result.reason = "the minimum cache pool inventory overflowed";
++            return result;
++        }
++        minimum_pool_bytes += pool.pool_bytes;
++    }
++    minimum_pool_bytes = std::max(minimum_pool_bytes, minimum_slab_bytes);
++    if (minimum_pool_bytes > SIZE_MAX - scratch_bytes) {
++        result.reason = "the minimum cache pool inventory overflowed";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++    result.minimum_device_bytes = scratch_bytes + minimum_pool_bytes;
++
++    int useful_devices = 0;
++    for (const common_moe_cache_fit_device & device : result.devices) {
++        if (device.cache_bytes < result.minimum_device_bytes) continue;
++        useful_devices++;
++        if (device.cache_bytes > SIZE_MAX - result.cache_bytes) result.cache_bytes = SIZE_MAX;
++        else result.cache_bytes += device.cache_bytes;
++    }
++    if (useful_devices < min_devices) {
++        result.reason = "too few devices can hold the minimum expert pools";
++        LOG_INF("%s: MoE cache fit: %s (useful=%d, min=%d, min_device_bytes=%zu MiB)\n", __func__,
++                result.reason.c_str(), useful_devices, min_devices, result.minimum_device_bytes >> 20);
++        return result;
++    }
++    result.feasible = true;
++    result.reason = "cache pools are feasible";
++    return result;
++}
++
++static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
++        const common_moe_cache_params * params,
++        const std::vector<llama_moe_tensor_info> & tensors,
++        const std::vector<ggml_backend_dev_t> & devices,
++        const std::vector<llama_device_memory_data> & memory,
++        const std::vector<int64_t> & margins) {
++    common_moe_cache_fit_result result;
++    if (!params || params->mode == COMMON_MOE_CACHE_MODE_OFF) { result.reason = "disabled"; return result; }
++    ggml_moe_cache_api api = ggml_moe_cache_active();
++    if (!devices.empty()) {
++        const ggml_moe_cache_api owned = ggml_moe_cache_get(ggml_backend_dev_backend_reg(devices[0]));
++        if (owned.owner) api = owned;
++    }
++    if (!api.query_config || !api.query_device || !api.query_shape) {
++        result.reason = "no cache provider is loaded";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++    int automatic = -1;
++    if (params->mode_explicit) automatic = params->mode == COMMON_MOE_CACHE_MODE_AUTO ? 1 : 0;
++    ggml_moe_cache_config config = {};
++    if (!api.query_config(automatic, params->budget_mib, &config)) {
++        result.reason = "the cache provider is disabled";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++    if (tensors.empty()) { result.reason = "the model has no routed expert weight tensors"; return result; }
++    if (memory.size() != devices.size() + 1 || margins.size() != devices.size()) {
++        result.reason = "the fitted device inventory changed";
++        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++        return result;
++    }
++    std::vector<common_moe_cache_fit_device_input> device_inputs;
++    size_t min_expert_bytes = 0;
++    for (size_t index = 0; index < devices.size(); index++) {
++        ggml_moe_cache_device_caps caps = {};
++        if (!api.query_device(devices[index], &config, &caps)) continue;
++        if (margins[index] < 0 || memory[index].free < margins[index]) {
++            result.reason = "the fitted device margin exceeds free memory";
++            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++            return result;
++        }
++        device_inputs.push_back({caps.physical_device, caps.compute_capability,
++                memory[index].free - margins[index], memory[index].mb.total()});
++        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
++    }
++    std::vector<common_moe_cache_fit_shape_input> shape_inputs;
++    shape_inputs.reserve(tensors.size());
++    for (const llama_moe_tensor_info & tensor : tensors) {
++        if (tensor.n_expert <= 0 || tensor.expert_size == 0 ||
++            (uint64_t) tensor.n_expert > SIZE_MAX / tensor.expert_size) {
++            result.reason = "the model has an invalid routed expert tensor size";
++            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
++            return result;
++        }
++        const size_t tensor_bytes = (size_t) tensor.n_expert * tensor.expert_size;
++        ggml_moe_cache_shape_caps caps = {};
++        const bool cacheable = tensor.expert_size >= min_expert_bytes &&
++            api.query_shape(tensor.type, tensor.n_input, tensor.n_output, tensor.n_expert,
++                    tensor.expert_size, &caps);
++        shape_inputs.push_back({tensor.type, tensor.expert_size, tensor_bytes,
++                caps.scratch_bytes, caps.pool_bytes, cacheable});
++    }
++    return common_moe_cache_plan_fit(device_inputs, shape_inputs, config.reserve_bytes,
++            config.budget_bytes, config.min_devices, config.minimum_slab_bytes);
++}
