@@ -349,6 +349,106 @@ function Repair-MmvqMergeDrift {
     Write-Host "Applied semantic repair: kept TurboQuant mmvq.cu coherent instead of mixing incompatible mainline MMVQ rewrites."
 }
 
+function Repair-Eagle3MergeDrift {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FeatureSha
+    )
+
+    $eagle3 = "src/models/eagle3.cpp"
+    if (-not (Test-Path $eagle3)) { return }
+
+    $text = Get-Content $eagle3 -Raw
+    $entryPoint = '\bllama_model_eagle3::build_arch_graph\s*\('
+    $count = [regex]::Matches($text, $entryPoint).Count
+    if ($count -le 1) { return }
+    if ($count -ne 2) { throw "Unexpected eagle3 build_arch_graph definition count: $count" }
+
+    # The feature header declares llm_build_eagle3_encode/decode.  A clean merge
+    # can retain that implementation and append mainline's newer graph-template
+    # implementation, producing two entry points.  Keep the coherent feature
+    # translation unit instead of mixing the incompatible graph APIs.
+    Invoke-Git checkout $FeatureSha -- $eagle3
+    $repaired = Get-Content $eagle3 -Raw
+    if ([regex]::Matches($repaired, $entryPoint).Count -ne 1) {
+        throw 'Feature eagle3 translation unit invariant failed after restore'
+    }
+    Invoke-Git add -- $eagle3
+    Invoke-Git commit -m "integration: keep feature eagle3 translation unit coherent"
+    Write-Host 'Restored the coherent feature-owned eagle3 implementation after duplicate mainline entry-point merge drift.'
+}
+
+function Assert-NoDuplicateModelEntryPoints {
+    $duplicates = @()
+    Get-ChildItem -Path "src/models" -Filter "*.cpp" | ForEach-Object {
+        $matches = @([regex]::Matches((Get-Content $_.FullName -Raw), '\b(llama_model_[A-Za-z0-9_]+)::build_arch_graph\s*\('))
+        $matches | Group-Object { $_.Groups[1].Value } | Where-Object { $_.Count -gt 1 } | ForEach-Object {
+            $duplicates += "$($_.Name) in $($_.PSParentPath) ($($_.Count) definitions)"
+        }
+    }
+    if ($duplicates.Count -gt 0) {
+        throw "Integrated model entry-point definitions are duplicated: $($duplicates -join '; ')"
+    }
+}
+
+function Repair-DsaIswaMergeDrift {
+    param([Parameter(Mandatory = $true)][string]$MainlineSha)
+
+    # The feature branch carried a placeholder header while the merged graph and
+    # model paths use the complete upstream DSA+ISWA memory context.  Restore
+    # the matched header and ensure its implementation is linked.
+    $header = "src/llama-kv-cache-dsa-iswa.h"
+    $cmake = "src/CMakeLists.txt"
+    if ((Test-Path $header) -and ((Get-Content $header -Raw) -match 'minimal placeholder')) {
+        Invoke-Git checkout $MainlineSha -- $header
+        Invoke-Git add -- $header
+        Invoke-Git commit -m "integration: restore DSA ISWA memory context header"
+    }
+    $text = Get-Content $cmake -Raw
+    if ($text -notmatch '(?m)^\s*llama-kv-cache-dsa-iswa\.cpp\s*$') {
+        $needle = "            llama-kv-cache-dsa.cpp"
+        if (-not $text.Contains($needle)) { throw "DSA ISWA source insertion point missing" }
+        Set-Content -Path $cmake -Value $text.Replace($needle, "$needle`r`n            llama-kv-cache-dsa-iswa.cpp") -Encoding UTF8
+        Invoke-Git add -- $cmake
+        Invoke-Git commit -m "integration: link DSA ISWA memory implementation"
+    }
+}
+
+function Repair-ValidatedMainlineMergeDrift {
+    # This patch is deliberately narrow: it records the source/header pairs
+    # that compiled and linked together in the CPU preflight.  Its guard makes
+    # an upstream layout change fail loudly instead of applying a fuzzy repair.
+    $patch = Join-Path $PSScriptRoot "patches/validated-mainline-merge-drift.patch"
+    if (-not (Test-Path $patch)) { throw "Validated merge-drift patch is missing: $patch" }
+
+    $context = Get-Content "src/llama-context.cpp" -Raw
+    if ($context -match 'gf_res_prev->reset\(\)') {
+        Invoke-Git apply --check $patch
+        Invoke-Git apply $patch
+        Invoke-Git add -- src/CMakeLists.txt src/llama-context.cpp src/llama-graph.cpp src/llama-model-loader.cpp src/llama-model-loader.h src/llama-model-saver.cpp src/llama-model.cpp src/llama-quant.cpp
+        Invoke-Git commit -m "integration: repair validated mainline API merge drift"
+        Write-Host "Applied CPU-validated context, graph, loader, model and quantization merge repair."
+        return
+    }
+
+    & git apply --reverse --check $patch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Integrated source matches neither the validated merge-drift patch preimage nor postimage"
+    }
+}
+
+function Repair-DflashMergeDrift {
+    $patch = Join-Path $PSScriptRoot "patches/validated-dflash-merge-drift.patch"
+    if (-not (Test-Path $patch)) { throw "Validated DFlash merge-drift patch is missing: $patch" }
+    $source = Get-Content "src/models/dflash.cpp" -Raw
+    if ($source -match 'copy_tensor_async_floats') { return }
+    Invoke-Git apply --check --whitespace=nowarn $patch
+    Invoke-Git apply --whitespace=nowarn $patch
+    Invoke-Git add -- src/models/dflash.cpp
+    Invoke-Git commit -m "integration: repair DFlash feature merge drift"
+    Write-Host "Applied CPU-validated DFlash feature repair."
+}
+
 function Repair-CublasHandleApiDrift {
     $mmvqTq = "ggml/src/ggml-cuda/mmvq-tq.cu"
     if (-not (Test-Path $mmvqTq)) {
@@ -617,11 +717,16 @@ try {
         Repair-ModelHeaderMergeDrift
         Repair-MissingMainlineModelDeclarations -MainlineSha $mainlineSha
         Repair-ModelApiMergeDrift -MainlineSha $mainlineSha -FeatureSha $featureSha
+        Repair-Eagle3MergeDrift -FeatureSha $featureSha
+        Repair-ValidatedMainlineMergeDrift
+        Repair-DsaIswaMergeDrift -MainlineSha $mainlineSha
+        Repair-DflashMergeDrift
         Repair-MmvqMergeDrift -FeatureSha $featureSha
         Repair-CublasHandleApiDrift
         Repair-CudaFattnSharedMemory
         Repair-VulkanFlashAttentionTypeConstants
         Repair-UnorderedMapInclude
+        Assert-NoDuplicateModelEntryPoints
         Assert-CleanIntegration
     }
 
